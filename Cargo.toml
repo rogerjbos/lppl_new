@@ -1,0 +1,23 @@
+[package]
+name = "lppl_new"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8.5"
+num-format = "0.4.4"
+cmaes = "0.2.1"
+argmin = { version = "0.10.0" }
+num = "0.4.3"
+nalgebra = "0.33.0"
+argmin-math = { version = "*", features = ["ndarray_latest"]}
+argmin-observer-slog = { version = "*"}
+ndarray = "0.15.6"
+chrono = { version = "0.4.38", features = ["serde"] }
+serde = { version = "1.0.210", features = ["derive"] }
+polars = { version = "0.43.1", features = ["polars-io","timezones","lazy","csv","temporal","describe","json","parquet","dtype-datetime","streaming","concat_str","list_eval","dtype-array","rank","dtype-struct","rolling_window","strings"]}
+serde_json = "1.0.114"
+futures = "0.3.30"
+tokio = { version = "1.36", features = ["full", "test-util"] }
+clickhouse = { version = "0.12.2", features = ["native-tls"] } 
+

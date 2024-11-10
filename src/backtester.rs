@@ -1,0 +1,585 @@
+use polars::prelude::*;
+use serde::{Serialize};
+use std::{cmp, collections::HashSet, env, error::Error as StdError, fmt, fmt::Debug, fs::File, 
+    io::Cursor, path::Path, sync::Arc};
+use tokio::{fs, task::JoinError};
+
+
+use crate::clickhouse_mod::write_price_file;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Backtest {
+    pub ticker: String,
+    pub universe: String,
+    pub strategy: String,
+    pub expectancy: f64,
+    pub profit_factor: f64,
+    pub hit_ratio: f64,
+    pub realized_risk_reward: f64,
+    pub avg_gain: f64,
+    pub avg_loss: f64,
+    pub max_gain: f64,
+    pub max_loss: f64,
+    pub buys: i32,
+    pub sells: i32,
+    pub trades: i32,
+    pub date: String,
+    pub buy: i32,
+    pub sell: i32,
+    pub pos_conf: f32,
+    pub neg_conf: f32
+}
+
+#[derive(Debug, Serialize)]
+pub struct BuySell {
+    pub buy: Vec<i32>,
+    pub sell: Vec<i32>
+}
+
+pub fn test() -> Result<(), Box<dyn StdError>> {
+
+    println!("hello world!");
+    Ok(())
+}
+
+// #[derive(Debug)]
+pub struct Signal {
+    pub name: String,
+    pub param1: f64,
+    pub param2: f64,
+    pub f: Arc<dyn Fn(DataFrame) -> BuySell + Send + Sync>,
+}
+
+impl fmt::Debug for Signal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Signal")
+            .field("name", &self.name)
+            .field("param1", &self.param1)
+            .field("param2", &self.param2)
+            // Don't include the function field in the debug output
+            .finish()
+    }
+}
+
+// Define the function type for your signals
+pub type SignalFunction = fn(DataFrame, f64, f64) -> BuySell;
+
+pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
+
+    let len = df.height();
+    let mut buy = vec![0; len];
+    let mut sell = vec![0; len];
+    
+    let pos = df.column("pos_conf").unwrap().f64().unwrap(); 
+    let neg = df.column("neg_conf").unwrap().f64().unwrap(); 
+    let _close = df.column("Close").unwrap().f64().unwrap(); 
+
+    for i in 1..len-1 {
+        let pos_0 = pos.get(i).unwrap();
+        let _pos_1 = pos.get(i-1).unwrap();
+        let neg_0 = neg.get(i).unwrap();
+        let _neg_1 = neg.get(i-1).unwrap();
+        if pos_0 > pos_level
+            {
+                buy[i + 1] = 1;
+            }
+        else if neg_0 > neg_level
+            {
+                sell[i + 1] = -1;
+            }
+    }
+    BuySell { buy, sell }
+}
+
+async fn concat_dataframes(dfs: Vec<DataFrame>) -> Result<DataFrame, PolarsError> {
+    let lazy_frames: Vec<LazyFrame> = dfs.into_iter().map(|df| df.lazy()).collect();
+    
+    // Use the concat function for LazyFrames
+    let concatenated_lazy_frame = concat(
+        &lazy_frames,
+        UnionArgs::default(),
+    )?;
+
+    // Collect the concatenated LazyFrame back into a DataFrame
+    let result_df = concatenated_lazy_frame.collect()?;
+
+    Ok(result_df)
+}
+    
+pub async fn summary_performance_file(path: String, production: bool, univ: Vec<String>) -> Result<String, Box<dyn StdError>> {
+    
+    let bt_col_names = vec![
+        "ticker", "universe", "strategy", "expectancy", "profit_factor", "hit_ratio",
+        "realized_risk_reward", "avg_gain", "avg_loss", "max_gain", "max_loss", "buys", "sells", 
+        "trades", "date", "buy", "sell"
+    ];
+    let set_bt: HashSet<_> = bt_col_names.iter().cloned().collect();
+
+    let b_names = vec!["ticker", "universe", "strategy", "date", "buy", "sell"];
+    let stocks = !univ.contains(&"Crypto".to_string());
+
+    let folder = match (stocks, production) {
+        (true, true)   => "output/production",
+        (true, false)  => "output/testing",
+        (false, true)  => "output_crypto/production",
+        (false, false) => "output_crypto/testing",
+    };
+
+    let dir_path = format!("{}/{}", path, folder);
+    let mut a: Vec<DataFrame> = Vec::new();
+    let mut b: Vec<DataFrame> = Vec::new();
+    let mut entries = fs::read_dir(&dir_path).await?;
+    println!("dir_path: {}", &dir_path);
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        // println!("path: {:?}", &path);
+
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+
+            let lf = LazyFrame::scan_parquet(
+                path.to_str().expect("path error"),
+                ScanArgsParquet::default(),
+            )?
+            .with_column(
+                col("expectancy").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("profit_factor").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("hit_ratio").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("realized_risk_reward").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("avg_gain").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("avg_loss").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("max_gain").fill_null(lit(0.0))
+            )
+            .with_column(
+                col("max_loss").fill_null(lit(0.0))
+            )
+            .collect();
+            // println!("lf: {:?} ", &lf); 
+            // println!("lf: {:?} ", &lf?.get_column_names()); 
+            match lf {
+                Ok(df) => {
+                    // Ensure all required columns are present
+                    let df_names = df.get_column_names();
+                    let set_df: HashSet<_> = df_names.into_iter().map(|s| s.as_str()).collect();
+                    if set_bt.is_subset(&set_df) {
+                        a.push(df.select(bt_col_names.clone())?);
+                        b.push(df.select(b_names.clone())?);
+                    }
+                },
+                Err(e) => println!("Error processing file {}: {}", path.display(), e),
+            }
+        }
+    }
+
+    // ALL
+    let df = concat_dataframes(a).await?;
+    // println!("parquet: {:?}", df.clone());
+    // println!("parquet columns: {:?}", df.clone().get_column_names());
+    
+
+
+    let mut out = summary_performance(df.clone())?;
+    println!("Average Performance by Strategy:\n {:?}", out);
+    
+    let datetag = df.column("date")?
+        .get(0)?
+        .to_string()
+        .trim_matches('"')
+        .replace("-", "");
+
+    let tag: &str = if stocks { "stocks" } else { "crypto" };
+
+    let perf_filename = if production { 
+        format!("{}/performance/{}_all_{}.csv", path, tag, &datetag) 
+    } else {
+        format!("{}/performance/{}_testing.csv", path, tag) 
+    };
+
+    let mut file = File::create(perf_filename)?;
+    let _ = CsvWriter::new(&mut file).finish(&mut out);
+
+    // coverage
+    if production {
+
+        // concat all the price dfs 
+        let mut p: Vec<DataFrame> = Vec::new();
+        // let univ = ["Crypto","LC1","LC2","MC1","MC2","SC1","SC2","SC3","SC4","Micro1","Micro2"];
+        for u in univ {
+            let file_path = format!("{}/data/production/{}.csv", path, u);
+            // let tmp = LazyFrame::scan_parquet(file_path, ScanArgsParquet::default())?;
+            let mut schema = Schema::with_capacity(8);
+            schema.with_column("Date".into(), DataType::Date);
+            schema.with_column("Ticker".into(), DataType::String);
+            schema.with_column("Universe".into(),DataType::String);
+            schema.with_column("Open".into(), DataType::Float64);
+            schema.with_column("High".into(), DataType::Float64);
+            schema.with_column("Low".into(), DataType::Float64);
+            schema.with_column("Close".into(), DataType::Float64);
+            schema.with_column("Volume".into(), DataType::Float64);
+            let schema = Arc::new(schema);
+        
+            let tmp = LazyCsvReader::new(file_path)
+                .with_schema(Some(schema))
+                .with_has_header(true)
+                .finish()?;
+        
+            let grouped = tmp.group_by_stable([col("Ticker")])
+                .agg([ 
+                    col("Date").count().alias("observations"),
+                    col("Date").last().alias("last date") 
+                ])
+                .sort(vec!["Ticker"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
+
+                p.push(grouped.collect().unwrap());
+        }
+        let all_p = concat_dataframes(p).await?;
+
+        let df_grouped = df.lazy().group_by_stable([col("ticker")])
+            .agg([ col("strategy").count().alias("strategies") ])
+            .sort(vec!["ticker"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
+
+        let both = all_p.lazy()
+            .inner_join(df_grouped, col("Ticker"), col("ticker"))
+            .filter(
+                col("strategies").lt(lit(121))
+            )
+            .sort(vec!["strategies"], SortMultipleOptions {descending: vec![false], ..Default::default()})
+            .collect();
+        println!("Strategy Coverage: {:?}", both);
+
+        // buys and sells for the current date
+        let df_b = concat_dataframes(b).await?;
+        let mut buys = df_b.clone().lazy()
+            .filter(col("buy").eq(lit(1)))
+            .sort(vec!["ticker"], SortMultipleOptions {descending: vec![false], ..Default::default()})
+            .collect()?;
+
+        let mut sells = df_b.lazy()
+            .filter(col("sell").eq(lit(-1)))
+            .sort(vec!["ticker"], SortMultipleOptions {descending: vec![false], ..Default::default()})
+            .collect()?;
+
+        let buy_filename = format!("{}/performance/{}_buys_{}.csv", path, tag, datetag);
+        let mut buy_file = File::create(buy_filename)?;
+        let _ = CsvWriter::new(&mut buy_file).finish(&mut buys);
+    
+        let sell_filename = format!("{}/performance/{}_sells_{}.csv", path, tag, datetag);
+        let mut sell_file = File::create(sell_filename)?;
+        let _ = CsvWriter::new(&mut sell_file).finish(&mut sells);
+    
+    };
+
+    // only show for testing
+    if !production {
+
+        // LC
+        let lc = out.clone()
+        .lazy()
+        .filter(
+            col("universe").eq(lit("LC1"))
+            .or(col("universe").eq(lit("LC2")))
+        )
+        .collect();
+
+        match lc {
+            Ok(ref _df) => {
+                let perf_filename = format!("{}/performance/{}.csv", path, "LC");
+                let mut file = File::create(perf_filename)?;
+                let _ = CsvWriter::new(&mut file).finish(&mut lc?);
+            },
+            Err(ref e) => println!("Error filtering DataFrame for LC: \n{:?}", e),
+        }
+
+        // MC
+        let mc = out.clone()
+        .lazy()
+        .filter(
+            col("universe").eq(lit("MC1"))
+            .or(col("universe").eq(lit("MC2")))
+        )
+        .collect();
+
+        match mc {
+            Ok(ref _df) => {
+                let perf_filename = format!("{}/performance/{}.csv", path, "MC");
+                let mut file = File::create(perf_filename)?;
+                let _ = CsvWriter::new(&mut file).finish(&mut mc?);
+            },
+            Err(ref e) => println!("Error filtering DataFrame for MC: \n{:?}", e),
+        }
+
+        // SC
+        let sc = out.clone()
+        .lazy()
+        .filter(
+            col("universe").eq(lit("SC1"))
+            .or(col("universe").eq(lit("SC2")))
+            .or(col("universe").eq(lit("SC3")))
+            .or(col("universe").eq(lit("SC4")))
+        )
+        .collect();
+
+        match sc {
+            Ok(ref _df) => {
+                let perf_filename = format!("{}/performance/{}.csv", path, "SC");
+                let mut file = File::create(perf_filename)?;
+                let _ = CsvWriter::new(&mut file).finish(&mut sc?);
+            },
+            Err(ref e) => println!("Error filtering DataFrame for SC: \n{:?}", e),
+        }
+
+        // Microcap
+        let micro = out
+        .lazy()
+        .filter(
+            col("universe").eq(lit("Micro1"))
+            .or(col("universe").eq(lit("Micro2")))
+        )
+        .collect();
+
+        match micro {
+            Ok(ref _df) => {
+                let perf_filename = format!("{}/performance/{}.csv", path, "Micro");
+                let mut file = File::create(perf_filename)?;
+                let _ = CsvWriter::new(&mut file).finish(&mut micro?);
+            },
+            Err(ref e) => println!("Error filtering DataFrame for Micro: \n{:?}", e),
+        }
+    }
+
+    Ok(datetag)
+}
+
+pub fn summary_performance(df: DataFrame)-> Result<DataFrame, Box<dyn StdError>> {       
+    let out = df.lazy()
+        .group_by_stable([col("strategy"), col("universe")])
+        .agg([
+            col("hit_ratio").mean().alias("hit_ratio"),
+            col("realized_risk_reward").mean().alias("risk_reward"),
+            col("avg_gain").mean().alias("avg_gain"),
+            col("avg_loss").mean().alias("avg_loss"),
+            col("max_gain").mean().alias("max_gain"),
+            col("max_loss").mean().alias("max_loss"),
+            col("buys").mean().alias("buys"),
+            col("sells").mean().alias("sells"),
+            col("trades").mean().alias("trades"),
+            col("profit_factor").count().alias("N"),
+            col("expectancy").mean().alias("expectancy"),
+            col("profit_factor").mean().alias("profit_factor"),      
+        ])
+        .filter(col("trades").gt(lit(3)))
+        .sort(vec!["hit_ratio"], SortMultipleOptions {descending: vec![false], ..Default::default()})
+        .collect()?;
+
+    Ok(out)
+}
+
+// Apply a signal function to data and calculate strategy performance
+pub async fn sig(df: LazyFrame, signal: &Signal) -> Result<Backtest, Box<dyn StdError>> {
+    let func = &signal.f;
+    let s = func(df.clone().collect()?);
+    let bt = backtest_performance(df.collect()?, s, &signal.name)?;
+    println!("bt_sig: {:?}", bt.clone());
+    Ok(bt)
+}
+
+pub async fn run_all_backtests(df: LazyFrame, signals: Vec<Signal>) -> Result<Vec<Backtest>, JoinError> {
+    // wrap df in an Arc for shared ownership across tasks
+    let df = Arc::new(df);
+
+    let futures: Vec<_> = signals.into_iter()
+        .map(|signal| {
+            // clone Arc for each task
+            let df_clone = Arc::clone(&df);
+            tokio::spawn(async move { 
+                sig(df_clone.as_ref().clone(), &signal).await.unwrap()
+            })
+        })
+        .collect();
+    
+    let results = futures::future::join_all(futures).await;
+
+    // Handle the results, assuming `sig` returns `Result<Backtest, _>`
+    let backtests: Vec<Backtest> = results.into_iter()
+        .filter_map(Result::ok).collect();
+
+    // let _ = showbt(backtests[0].clone());
+    Ok(backtests)
+}
+
+pub async fn create_price_files(univ_vec: Vec<String>, production: bool) -> Result<(), Box<dyn StdError>> {
+    
+    let folder = if production { "production" } else { "testing" };
+
+    for u in univ_vec {
+
+        let user_path = match env::var("CLICKHOUSE_USER_PATH") {
+            Ok(path) => path,
+            Err(_) => String::from("/srv"),
+        };
+        let file_path = format!("{}/rust_home/lppl_new/data/{}/{}.csv", user_path, folder.to_string(), u.to_string());
+        let file_path: &str = &file_path;
+        if production==false && Path::new(&file_path).exists() {
+            println!("Price file exists for {}", file_path);
+        } else {
+            println!("Price file generating for {}", file_path);
+            write_price_file(u, production).await?;
+        }
+    }
+    Ok(())
+}
+    
+
+pub fn backtest_performance(df: DataFrame, side: BuySell, strategy: &str) -> Result<Backtest, Box<dyn StdError>> {
+
+    let len = df.height();
+    
+    let mut long_result = vec![0.0; len];
+    let mut short_result = vec![0.0; len];
+    
+    let open = df.column("Open").unwrap().f64().unwrap(); 
+
+    // Variable holding period
+    for i in 0..len {
+        if side.buy[i] == 1 {
+            for a in i+1..cmp::min(i + 1000, len) {
+                if side.buy[a] == 1 || side.sell[a] == -1 {
+                    long_result[a] = open.get(a).unwrap() - open.get(i).unwrap();
+                    break
+                }
+            }
+        }
+    }            
+    for i in 0..len {
+        if side.sell[i] == -1 {
+            for a in i+1..cmp::min(i + 1000, len) {
+                if side.buy[a] == 1 || side.sell[a] == -1 {
+                    short_result[a] = open.get(i).unwrap() - open.get(a).unwrap();
+                    break
+                }
+            }
+        }
+    }   
+
+    // Aggregating the long & short results into one column
+    let total_result: Vec<f64> = long_result.iter().zip(short_result.iter()).map(|(&l, &s)| l + s).collect();
+    // println!("total_result: {:?}", total_result);
+
+    // Profit factor   
+    let total_net_profits: Vec<f64> = total_result.clone().into_iter().filter(|&x| x > 0.0).collect();
+    let total_net_losses: Vec<f64> = total_result.clone().into_iter().filter(|&x| x < 0.0).collect();
+    let sum_total_net_profits = total_net_profits.iter().sum::<f64>();
+    let sum_total_net_losses = total_net_losses.iter().sum::<f64>().abs();
+    let profit_factor = f64::min(999., sum_total_net_profits / sum_total_net_losses);
+
+    // Hit ratio    
+    let hit_ratio: f64 = (total_net_profits.len() as f64 / (total_net_losses.len() + total_net_profits.len()) as f64) * 100.0;
+
+    // Risk reward ratio
+    let average_gain = sum_total_net_profits / total_net_profits.len() as f64;
+    let average_loss = sum_total_net_losses / total_net_losses.len() as f64;
+    let realized_risk_reward = average_gain / average_loss;
+
+    let trades: i32 = total_result.clone().into_iter().filter(|&x| x != 0.0).collect::<Vec<_>>().len() as i32;
+        
+    // Expectancy
+    let expectancy  = (average_gain * hit_ratio) - ((1. - hit_ratio) * average_loss);
+
+    let max_gain = total_net_profits.into_iter().max_by(|a, b| a.partial_cmp(b).unwrap());
+    let max_loss = total_net_losses.into_iter().min_by(|a, b| a.partial_cmp(b).unwrap());
+    
+    let buys = side.buy.iter().sum::<i32>();
+    let sells = side.sell.iter().sum::<i32>().abs();
+
+    let buy = side.buy[len-1];
+    let sell = side.sell[len-1];
+    let pos_conf = 0.0; //df.pos_conf[len-1];
+    let neg_conf = 0.0; //df.neg_conf[len-1];
+    let ticker1 = df.column("Ticker").unwrap().get(0).unwrap().to_string();
+    let ticker = ticker1.trim_matches('"').to_string();
+    let universe1 = df.column("Universe").unwrap().get(0).unwrap().to_string();
+    let universe = universe1.trim_matches('"').to_string();
+    let date1 = df.column("Date").unwrap().get(len-1).unwrap().to_string();
+    let date = date1.trim_matches('"').to_string();
+    // println!("finished {} signal {:?}", ticker, strategy);
+
+    Ok(Backtest {
+        ticker: ticker,
+        universe: universe,
+        strategy: strategy.to_string(), 
+        expectancy,
+        profit_factor: profit_factor,
+        hit_ratio: hit_ratio, 
+        realized_risk_reward: realized_risk_reward,
+        avg_gain: average_gain,
+        avg_loss: average_loss,
+        max_gain: match max_gain {
+            Some(x) => x,
+            None => 0.0,
+        }, 
+        max_loss: match max_loss {
+            Some(x) => x,
+            None => 0.0,
+        },  
+        buys: buys,  
+        sells: sells,  
+        trades: trades,
+        date: date,
+        buy: buy,  
+        sell: sell,
+        pos_conf: pos_conf,
+        neg_conf: neg_conf
+    })
+
+}
+
+pub fn showbt(bt: Backtest) -> Result<(), Box<dyn StdError>> {
+    println!("");
+    println!("Ticker:           {}", bt.ticker);
+    println!("Universe:         {}", bt.universe);
+    println!("Strategy:         {}", bt.strategy);
+    println!("Profit Factor:    {:.1}", bt.profit_factor);
+    println!("Hit Ratio:        {:.1}", bt.hit_ratio);
+    println!("Expectancy:       {:.1}", bt.expectancy);
+    println!("Risk-Reward:      {:.1}", bt.realized_risk_reward);
+    println!("Avg Gain:         {:.1}", bt.avg_gain);
+    println!("Avg Loss:         {:.1}", bt.avg_loss);
+    println!("Max Gain:         {:.1}", bt.max_gain);
+    println!("Max Loss:         {:.1}", bt.max_loss);
+    println!("Buys:             {:.1}", bt.buys);
+    println!("Sells:            {:.1}", bt.sells);
+    println!("Trades:           {:.1}", bt.trades);
+    Ok(())
+}
+
+pub async fn parquet_save_backtest(path: String, bt: Vec<Backtest>, univ: &str, ticker: String, production: bool) -> Result<(), Box<dyn StdError>> { 
+    // 2. Jsonify your struct Vec
+    let json = serde_json::to_string(&bt)?;
+    // 3. Create cursor from json 
+    let cursor = Cursor::new(json);
+    // 4. Create polars DataFrame from reading cursor as json
+    let mut df = JsonReader::new(cursor).finish()?;
+
+    let folder = if production { "production".to_string() } else { "testing".to_string() };
+    let file_path = match univ {
+        "Crypto" => format!("{}/output_crypto/{}/{}.parquet", &path, folder, &ticker),
+        _ => format!("{}/output/{}/{}.parquet", &path, folder, &ticker),
+    };
+    
+
+    let mut file = File::create(file_path)?;
+    ParquetWriter::new(&mut file).finish(&mut df)?;
+    Ok(())
+}
