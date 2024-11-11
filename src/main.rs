@@ -3,8 +3,8 @@ use polars::prelude::*;
 use std::{error::Error as StdError, env};
 use lppl_new::*;
 use crate::backtester::*;
-
-
+// use crate::clickhouse_mod::create_score_table;
+   
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
 
@@ -15,8 +15,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     };
     let default_path: String = format!("{}/rust_home/lppl_new", user_path);
     
-    let default_production: String = "testing".to_string();
-    let default_univ = "Stocks".to_string();
+    let default_production: String = "production".to_string();
+    let default_univ = "MC".to_string();
     let batch_size: usize = 10;
 
     // collect command line args
@@ -29,86 +29,98 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let univ: &[&str] = match univ_str {
         "SC" => &["SC1", "SC2", "SC3", "SC4"],
         "MC" => &["MC1", "MC2"],
+        //"MC" => &["MC1"],
         "LC" => &["LC1", "LC2"],
         "Micro" => &["Micro1", "Micro2", "Micro3", "Micro4"],
         "Stocks" => &["SC1", "SC2", "SC3", "SC4","MC1", "MC2","LC1", "LC2","Micro1", "Micro2", "Micro3", "Micro4"],
-        "All" => &["Crypto", "SC1", "SC2", "SC3", "SC4","MC1", "MC2","LC1", "LC2","Micro1", "Micro2", "Micro3", "Micro4"],
         _ => &["Crypto"],
     };
     let univ_vec: Vec<String> = univ.iter().map(|&s| s.into())
-        //.take(2) // used for testing purposes
         .collect();
 
-    // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
-    let paths = if production {
-        vec!(
-            // format!("{}/fit/production", path),
-            // format!("{}/output/production", path),
-            // format!("{}/output_crypto/production", path),
-            format!("{}/data/production", path)
-        )
-    } else {
-        vec!(
-            format!("{}/fit/testing", path),
-            format!("{}/output/testing", path),
-            format!("{}/output_crypto/testing", path),
-            format!("{}/data/testing", path)
-        )
-    };
+    let overwrite = true; // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
+    let run_prices = true;
+    let run_fits = true;
+    let run_backtests = true;
+    let run_performance = true;
 
-    for p in paths {
-        delete_all_files_in_folder(p).await?;
-    }
-    
     // GENERATE PRICE FILE FOR EACH UNIVERSE
     // saves CSV files for each universe to /data/testing or /data/production
-    create_price_files(univ_vec.clone(), production.clone()).await?;
+    if run_prices {
+        if overwrite {
+            delete_all_files_in_folder(format!("{}/data/{}", path, production_str)).await?;
+        }
+        create_price_files(univ_vec.clone(), production.clone()).await?;
+    }
 
     // COMPUTE NESTED FITS FOR EACH UNIVERSE
     // save fit files to /fit/testing or /fit/production    
-    for u in univ {
-        // println!("u: {}", u);
-        println!("Compute nested fits starting: {}", u);
-        let _ = fits_helper(path.to_string(), u, batch_size, production).await;
+    if run_fits {
+        if overwrite {
+            let folder = format!("{}/fit/{}", path, production_str);
+            // println!("folder: {}", folder);
+            delete_all_files_in_folder(folder).await?;
+        }
+        for u in univ {
+            let _ = fits_helper(path.to_string(), u, batch_size, production).await;
+        }
+        println!("All Fits done");
     }
 
     // RUN BACKTEST FOR EACH UNIVERSE
     // save parquet files to /output/testing or /output/production
-    for u in univ {
-        println!("Backtest starting: {}", u);
-        let _ = backtest_helper(path.to_string(), u, batch_size, production).await;
+    if run_backtests {
+        if overwrite {
+            let s = if univ.contains(&"Crypto") { "_crypto" } else { "" };
+            let folder = format!("{}/output{}/{}", path, s, production_str);
+            // println!("folder: {}", folder);
+            delete_all_files_in_folder(folder).await?;
+        }
+        for u in univ {
+            let _ = backtest_helper(path.to_string(), u, batch_size, production).await;
+        }
+        println!("All Backtest done");
     }
 
-    // // SHOW AGGREGATED RESULTS BY STRATEGY
-    // println!("Performance starting: {:?} {}", &path, &production);
-    let datetag = summary_performance_file((&path).to_string(), production, univ_vec.clone()).await?;
-    if production {
-        let stocks = if univ.contains(&"Crypto") { false } else { true };
-        if let Err(e) = score(&datetag, stocks).await {
-            eprintln!("Error inserting scores: {}", e);
+    // SHOW AGGREGATED RESULTS BY STRATEGY
+    // save csv files to /performance
+    if run_performance {
+        if overwrite {
+            let folder = format!("{}/performance/MC.csv", path);
+            // println!("folder: {}", folder);
+            delete_all_files_in_folder(folder).await?;
         }
-    } else {
-        for u in univ_vec {
+        let datetag = summary_performance_file((&path).to_string(), production, univ_vec.clone()).await?;
+        // println!("summary done");
+    
+        if production {
+            let stocks = if univ.contains(&"Crypto") { false } else { true };
+            // let _ = create_score_table().await;
+            if let Err(e) = score(&datetag, stocks).await {
+                eprintln!("Error inserting scores: {}", e);
+            }
+        } else {
+            for u in univ_vec {
+                let tag = if u == "Crypto" {"crypto"} else {"stocks"};
+                let fname = format!("performance/{}_testing.csv", tag);
+                let lf = LazyCsvReader::new(fname)
+                    .with_has_header(true)
+                    .finish()?;
 
-            let tag = if u == "Crypto" {"crypto"} else {"stocks"};
-            let fname = format!("performance/{}_testing.csv", tag);
-            let lf = LazyCsvReader::new(fname)
-                .with_has_header(true)
-                .finish()?;
+                let rr = lf.clone()
+                    .filter(col("universe").eq(lit(&*u)))
+                    .sort(vec!["risk_reward"], SortMultipleOptions {descending: vec![false], ..Default::default()})
+                    .tail(5)
+                    .collect();
+                println!("{} risk_reward: {:?}", &u, rr);
 
-            let rr = lf.clone()
-                .filter(col("universe").eq(lit(&*u)))
-                .sort(vec!["risk_reward"], SortMultipleOptions {descending: vec![false], ..Default::default()})
-                .tail(5)
-                .collect();
-            println!("{} risk_reward: {:?}", &u, rr);
-
-            let hr = lf.clone()
-                .filter(col("universe").eq(lit(&*u)))
-                .sort(vec!["hit_ratio"], SortMultipleOptions {descending: vec![false], ..Default::default()})
-                .tail(5)
-                .collect();
-            println!("{} hit_ratio: {:?}", &u, hr);
+                let hr = lf.clone()
+                    .filter(col("universe").eq(lit(&*u)))
+                    .sort(vec!["hit_ratio"], SortMultipleOptions {descending: vec![false], ..Default::default()})
+                    .tail(5)
+                    .collect();
+                println!("{} hit_ratio: {:?}", &u, hr);
+            }
         }
     }
     Ok(())

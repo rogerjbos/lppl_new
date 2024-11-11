@@ -1,9 +1,11 @@
 #![allow(non_snake_case)]
 use polars::prelude::*;
 use serde::{Serialize};
-use std::{collections::HashSet, env, panic, fs::File, f64::consts::PI, error::Error as StdError, io::Cursor, path::Path, sync::Arc};
+use std::{collections::HashSet, env, panic, fs::File, f64::consts::PI, error::Error as StdError, path::Path, sync::Arc};
+use std::io::{Cursor, Error, ErrorKind};
 use chrono::{NaiveDate, Duration};
 use tokio::fs;
+
 
 pub mod backtester;
 use crate::backtester::*;
@@ -47,14 +49,39 @@ pub fn test_test() -> Result<(), Box<dyn StdError>> {
 
 }
 
-pub async fn delete_all_files_in_folder<P: AsRef<Path>>(folder_path: P) -> Result<(), std::io::Error> {
-    let mut dir = fs::read_dir(folder_path).await?;
-    while let Some(entry) = dir.next_entry().await? {
-        let path = entry.path();
-        if path.is_file() {
-            fs::remove_file(path).await?;
-        } else if path.is_dir() {
-            fs::remove_dir_all(path).await?;
+pub async fn delete_all_files_in_folder<P: AsRef<Path>>(path: P) -> Result<(), Error> {
+    let path = path.as_ref();
+
+    if path.is_file() {
+        // Attempt to delete the file and ignore "not found" errors
+        if let Err(e) = fs::remove_file(path).await {
+            if e.kind() != ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+    } else if path.is_dir() {
+        // Attempt to read and delete contents in the directory and ignore "not found" errors
+        let mut dir = match fs::read_dir(path).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()), // Ignore if directory not found
+            Err(e) => return Err(e),
+        };
+
+        while let Some(entry) = dir.next_entry().await? {
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                if let Err(e) = fs::remove_file(entry_path).await {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                }
+            } else if entry_path.is_dir() {
+                if let Err(e) = fs::remove_dir_all(entry_path).await {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -351,7 +378,7 @@ pub async fn run_fits(lf: LazyFrame, tag: &str) -> Result<(), Box<dyn StdError>>
     let res = compute_nested_fits(&time, &price, 120, 30, 1, 5)?;
     // println!("res: {:?}", res.select(["t2_d", "tc"])?);
 
-    println!("fname: {}", &fname);
+    // println!("fname: {}", &fname);
     let mut file = File::create(&fname)?;
     CsvWriter::new(&mut file).finish(&mut res.clone())?;  // Use clone to avoid moving `res`
     Ok(())
@@ -406,10 +433,12 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
         let out = df.left_join(&ind, ["Date"], ["t2_d"])?
             .lazy()
             .with_column(cols(["pos_conf","neg_conf"]).fill_null(lit(0.)));
-        println!("out with ind: {:?}", &out.clone().collect());
+        // println!("out with ind: {:?}", &out.clone().collect());
 
         // needs to be awaited
         let mut signals: Vec<Signal> = Vec::new();
+        // println!("tag: {}", &tag);
+
         if !production { // testing
 
             for i in (10..=80).step_by(5) {
@@ -439,7 +468,7 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
             if tag == "sc" || tag == "SC1" || tag == "SC2" || tag == "SC3" || tag == "SC4" {
                 let param1: f64 = 0.12;
                 let param2: f64 = 0.46;
-                let name = format!("LPPL_SC_{}_{}", param1, param2).to_string();
+                let name = format!("lppl_{}_{}", param1, param2).to_string();
         
                 // Use a closure to capture param1 and param2
                 let function_with_params = move |df: DataFrame| -> BuySell {
@@ -460,7 +489,7 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 // test_0.13_0.61 ┆ Micro4   ┆ 38.801067 ┆ 1.517745 
                 let param1: f64 = 0.49;
                 let param2: f64 = 0.14;
-                let name = format!("LPPL_Micro_{}_{}", param1, param2).to_string();
+                let name = format!("lppl_{}_{}", param1, param2).to_string();
         
                 // Use a closure to capture param1 and param2
                 let function_with_params = move |df: DataFrame| -> BuySell {
@@ -479,7 +508,7 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 // test_0.39_0.24 ┆ MC2      ┆ 41.244379 ┆ 1.427864
                 let param1: f64 = 0.4;
                 let param2: f64 = 0.25;
-                let name = format!("LPPL_MC_{}_{}", param1, param2).to_string();
+                let name = format!("lppl_{}_{}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params = move |df: DataFrame| -> BuySell {
@@ -498,7 +527,7 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 // test_0.46_0.31 ┆ LC2      ┆ 31.706149 ┆ 1.442278  
                 let param1: f64 = 0.45;
                 let param2: f64 = 0.3;
-                let name = format!("LPPL_LC_{}_{}", param1, param2).to_string();
+                let name = format!("lppl_{}_{}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params = move |df: DataFrame| -> BuySell {
@@ -515,7 +544,7 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
             } else if tag == "crypto" || tag == "Crypto" {
                 let param1: f64 = 0.01; // check these
                 let param2: f64 = 0.01;
-                let name = format!("test_{}_{}", param1, param2).to_string();
+                let name = format!("lppl_{}_{}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params = move |df: DataFrame| -> BuySell {
@@ -540,13 +569,14 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
 
 pub async fn backtest_helper(path: String, u: &str, batch_size: usize, production: bool) -> Result<(), Box<dyn StdError>> {
  
+    println!("Backtest starting: {}", &u);
     let folder = if production { "production" } else { "testing" };
     let file_path = format!("{}/data/{}/{}.csv", path, folder, u);
-    // println!("file_path: {}", file_path);
+    // println!("backtest_helper file_path: {}", file_path);
 
     let lf = read_price_file(file_path).await?;
 
-    // println!("lf: {:?}", lf.clone().collect());
+    // println!("backtest_helper lf: {:?}", lf.clone().collect());
     // Collect the unique tickers into a DataFrame
     let unique_tickers_df = lf
         .clone()
@@ -558,13 +588,13 @@ pub async fn backtest_helper(path: String, u: &str, batch_size: usize, productio
 
     let output = if u == "Crypto" { "output_crypto" } else { "output" };
     let dir_path = format!("{}/{}/{}", path, output, folder);
-    // println!("dir_path: {}", dir_path);
+    // println!("backtest_helper dir_path: {}", dir_path);
 
     let mut filenames: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir_path)? {
         let entry = entry?;
         let path = entry.path();
-        // println!("path: {:?}", path);
+        // println!("backtest_helper path: {:?}", path);
 
         // Check if the entry is a file and has a `.parquet` extension
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("parquet") {
@@ -604,10 +634,10 @@ pub async fn backtest_helper(path: String, u: &str, batch_size: usize, productio
                 let tag: &str = match (production, u) {
                     (false, _) => "testing",
                     (true, "Crypto") => "crypto",
-                    (true, "Micro") => "micro",
-                    (true, "SC") => "sc",
-                    (true, "MC") => "mc",
-                    (true, "LC") => "lc",
+                    (true, u) if u.starts_with("Micro") => "micro",
+                    (true, u) if u.starts_with("SC") => "sc",
+                    (true, u) if u.starts_with("MC") => "mc",
+                    (true, u) if u.starts_with("LC") => "lc",
                     (_, _) => "crypto",
                 };
                 println!("Running {} '{}' backtests: {} of {}", u, ticker_clone, out_of - remaining, out_of);
@@ -628,6 +658,8 @@ pub async fn backtest_helper(path: String, u: &str, batch_size: usize, productio
         futures::future::join_all(futures).await;
         remaining -= last;
     }
+    println!("Backtest done: {}", &u);
+
     Ok(())
 }
 
@@ -650,13 +682,15 @@ pub async fn score(datetag: &str, stocks: bool) -> Result<(), Box<dyn StdError>>
     // println!("file_path: {}", &file_path);
 
     // Manually create the schema and add fields
-    let mut buysell_schema = Schema::with_capacity(6);
+    let mut buysell_schema = Schema::with_capacity(8);
     buysell_schema.with_column("ticker".into(), DataType::String);
     buysell_schema.with_column("universe".into(), DataType::String);
     buysell_schema.with_column("strategy".into(), DataType::String);
     buysell_schema.with_column("date".into(), DataType::Date);
     buysell_schema.with_column("buy".into(), DataType::Int64);
     buysell_schema.with_column("sell".into(), DataType::Int64);
+    buysell_schema.with_column("pos_conf".into(), DataType::Float64);
+    buysell_schema.with_column("neg_conf".into(), DataType::Float64);
     let buysell_schema = Arc::new(buysell_schema);
     
     let testing = LazyCsvReader::new(file_path).finish()?;
@@ -666,55 +700,36 @@ pub async fn score(datetag: &str, stocks: bool) -> Result<(), Box<dyn StdError>>
     let buys = LazyCsvReader::new(buy_path)
         .with_schema(Some(buysell_schema.clone()))
         .with_has_header(true)
-        .finish()?;
-        // .group_by_stable([col("date"), col("universe"), col("ticker")])
-        // .agg([
-        //     col("buy").sum().alias("side"),
-        //     col("risk_reward").sum().alias("risk_reward"),
-        //     col("expectancy").sum().alias("expectancy"),
-        //     col("profit_factor").sum().alias("profit_factor"),
-        // ])
-        // .sort(vec!["profit_factor"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
-    println!("buys: {:?}", buys.collect());
+        .finish()?
+        .sort(vec!["neg_conf"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
+    // println!("buys: {:?}", buys.clone().collect());
 
-    // // read in the sells
-    // let sell_path = format!("{}/{}_sells_{}.csv", path, tag, datetag);
-    // let sells = LazyCsvReader::new(sell_path)
-    //     .with_schema(Some(buysell_schema.clone()))
-    //     .with_has_header(true)
-    //     .finish()?
-    //     .group_by_stable([col("date"), col("universe"), col("ticker")])
-    //     .agg([
-    //         col("sell").sum().alias("side"),
-    //         (col("risk_reward").sum() * lit(-1.)).alias("risk_reward"),
-    //         (col("expectancy").sum() * lit(-1.)).alias("expectancy"),
-    //         (col("profit_factor").sum() * lit(-1.)).alias("profit_factor"),
-    //     ])
-    //     .sort(vec!["profit_factor"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
+    // read in the sells
+    let sell_path = format!("{}/{}_sells_{}.csv", path, tag, datetag);
+    let sells = LazyCsvReader::new(sell_path)
+        .with_schema(Some(buysell_schema.clone()))
+        .with_has_header(true)
+        .finish()?
+        .sort(vec!["pos_conf"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
 
-    // let both = concat(&[buys, sells], Default::default())?
-    //     .group_by_stable([col("date"), col("universe"), col("ticker")])
-    //     .agg([
-    //         col("side").sum().alias("side"),
-    //         col("risk_reward").sum().alias("risk_reward"),
-    //         col("expectancy").sum().alias("expectancy"),
-    //         col("profit_factor").sum().alias("profit_factor"),
-    //     ])
-    //     .sort(vec!["profit_factor"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()})
-    //     .collect()?;
+    let both = concat(&[buys, sells], Default::default())?
+        .sort(vec!["pos_conf","neg_conf"], SortMultipleOptions {descending: vec![false, true], nulls_last: vec![true, true], ..Default::default()})
+        .collect()?;
     // println!("both: {:?}", both);
 
-    // let both_path = format!("{}/score/{}_{}.csv", path, tag, datetag);
-    // let mut file = File::create(both_path)?;
-    // let _ = CsvWriter::new(&mut file).finish(&mut both.clone());
+    let path = format!("{}/rust_home/lppl_new", user_path);
+    let both_path = format!("{}/score/{}_{}.csv", path, tag, datetag);
+    println!("both_path: {:?}", both_path);
+    let mut file = File::create(both_path)?;
+    let _ = CsvWriter::new(&mut file).finish(&mut both.clone());
 
-    // if both.height() > 0 {
-    //     if let Err(e) = insert_score_dataframe(both).await {
-    //         eprintln!("Error in insert_score_dataframe: {}", e);
-    //     }
-    // } else {
-    //     println!("No observations: skipping insert.");
-    // }
+    if both.height() > 0 {
+        if let Err(e) = insert_score_dataframe(both).await {
+            eprintln!("Error in insert_score_dataframe: {}", e);
+        }
+    } else {
+        println!("No observations: skipping insert.");
+    }
 
     Ok(())
 }
@@ -802,6 +817,8 @@ pub async fn read_price_file(file_path: String) -> Result<LazyFrame, Box<dyn Std
 }
 
 pub async fn fits_helper(path: String, u: &str, batch_size: usize, production: bool) -> Result<(), Box<dyn StdError>> {
+    
+    println!("Compute nested fits starting: {}", &u);
     let folder = if production { "production" } else { "testing" };
     let file_path = format!("{}/data/{}/{}.csv", path, folder, u);
     // println!("here 0 file_path: {:?}", &file_path);

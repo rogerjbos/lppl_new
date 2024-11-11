@@ -1,9 +1,8 @@
 use polars::prelude::*;
 use serde::{Serialize};
 use std::{cmp, collections::HashSet, env, error::Error as StdError, fmt, fmt::Debug, fs::File, 
-    io::Cursor, path::Path, sync::Arc};
+    io::Cursor, path::Path, result::Result, sync::Arc};
 use tokio::{fs, task::JoinError};
-
 
 use crate::clickhouse_mod::write_price_file;
 
@@ -33,7 +32,9 @@ pub struct Backtest {
 #[derive(Debug, Serialize)]
 pub struct BuySell {
     pub buy: Vec<i32>,
-    pub sell: Vec<i32>
+    pub sell: Vec<i32>,
+    pub pos_conf: Vec<f32>,
+    pub neg_conf: Vec<f32>
 }
 
 pub fn test() -> Result<(), Box<dyn StdError>> {
@@ -69,6 +70,8 @@ pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
     let len = df.height();
     let mut buy = vec![0; len];
     let mut sell = vec![0; len];
+    let mut pos_conf = vec![0.; len];
+    let mut neg_conf = vec![0.; len];
     
     let pos = df.column("pos_conf").unwrap().f64().unwrap(); 
     let neg = df.column("neg_conf").unwrap().f64().unwrap(); 
@@ -81,19 +84,57 @@ pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
         let _neg_1 = neg.get(i-1).unwrap();
         if pos_0 > pos_level
             {
-                buy[i + 1] = 1;
+                sell[i + 1] = 1;
             }
         else if neg_0 > neg_level
             {
-                sell[i + 1] = -1;
+                buy[i + 1] = -1;
             }
+        pos_conf[i + 1] = pos_0 as f32;
+        neg_conf[i + 1] = neg_0 as f32;
+        
     }
-    BuySell { buy, sell }
+    BuySell { buy, sell , pos_conf, neg_conf }
 }
-
-async fn concat_dataframes(dfs: Vec<DataFrame>) -> Result<DataFrame, PolarsError> {
-    let lazy_frames: Vec<LazyFrame> = dfs.into_iter().map(|df| df.lazy()).collect();
     
+async fn concat_dataframes(dfs: Vec<DataFrame>) -> Result<DataFrame, PolarsError> {
+    if dfs.is_empty() {
+        return Err(PolarsError::ComputeError("No DataFrames to concatenate.".into()));
+    }
+
+    // Get the schema of the first DataFrame as the reference schema
+    let reference_schema = dfs[0].schema();
+    let mut compatible_dfs = Vec::new();
+    let mut incompatible_dfs = Vec::new();
+
+    // Separate compatible and incompatible DataFrames
+    for df in dfs {
+        let schema = df.schema();
+        let is_compatible = schema
+            .iter_fields()
+            .zip(reference_schema.iter_fields())
+            .all(|(field, ref_field)| field.dtype() == ref_field.dtype());
+
+        if is_compatible {
+            compatible_dfs.push(df);
+        } else {
+            incompatible_dfs.push((df, schema));
+        }
+    }
+
+    // For debugging, print details of incompatible DataFrames (up to 3) versus reference
+    for (i, (df, schema)) in incompatible_dfs.iter().enumerate() {
+        if i==0 {
+            println!("reference_schema: {:?}", reference_schema);
+        }
+        if i < 3 {
+            println!("Incompatible DataFrame {}: Schema: {:?}", i + 1, schema);
+        }
+    }
+
+    // Convert compatible DataFrames to LazyFrames for concatenation
+    let lazy_frames: Vec<LazyFrame> = compatible_dfs.into_iter().map(|df| df.lazy()).collect();
+
     // Use the concat function for LazyFrames
     let concatenated_lazy_frame = concat(
         &lazy_frames,
@@ -102,20 +143,21 @@ async fn concat_dataframes(dfs: Vec<DataFrame>) -> Result<DataFrame, PolarsError
 
     // Collect the concatenated LazyFrame back into a DataFrame
     let result_df = concatenated_lazy_frame.collect()?;
-
     Ok(result_df)
 }
-    
+
 pub async fn summary_performance_file(path: String, production: bool, univ: Vec<String>) -> Result<String, Box<dyn StdError>> {
     
+    println!("Performance starting for {}", if production {"Production"} else {"Testing"});
+
     let bt_col_names = vec![
         "ticker", "universe", "strategy", "expectancy", "profit_factor", "hit_ratio",
         "realized_risk_reward", "avg_gain", "avg_loss", "max_gain", "max_loss", "buys", "sells", 
-        "trades", "date", "buy", "sell"
+        "trades", "date", "buy", "sell", "pos_conf", "neg_conf"
     ];
     let set_bt: HashSet<_> = bt_col_names.iter().cloned().collect();
 
-    let b_names = vec!["ticker", "universe", "strategy", "date", "buy", "sell"];
+    let b_names = vec!["ticker", "universe", "strategy", "date", "buy", "sell", "pos_conf", "neg_conf"];
     let stocks = !univ.contains(&"Crypto".to_string());
 
     let folder = match (stocks, production) {
@@ -129,13 +171,15 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
     let mut a: Vec<DataFrame> = Vec::new();
     let mut b: Vec<DataFrame> = Vec::new();
     let mut entries = fs::read_dir(&dir_path).await?;
-    println!("dir_path: {}", &dir_path);
+    println!("summary performance dir_path: {}", &dir_path);
 
     while let Some(entry) = entries.next_entry().await? {
+
         let path = entry.path();
         // println!("path: {:?}", &path);
 
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            // println!("here 1: {:?}", &path.to_str());
 
             let lf = LazyFrame::scan_parquet(
                 path.to_str().expect("path error"),
@@ -166,10 +210,12 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
                 col("max_loss").fill_null(lit(0.0))
             )
             .collect();
-            // println!("lf: {:?} ", &lf); 
-            // println!("lf: {:?} ", &lf?.get_column_names()); 
+
             match lf {
                 Ok(df) => {
+                    // println!("lf: {:?}", df);
+                    // println!("lf column names: {:?}", df.get_column_names());
+
                     // Ensure all required columns are present
                     let df_names = df.get_column_names();
                     let set_df: HashSet<_> = df_names.into_iter().map(|s| s.as_str()).collect();
@@ -182,17 +228,16 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
             }
         }
     }
+    // println!("here 7 a: {:?}", a);
 
     // ALL
     let df = concat_dataframes(a).await?;
     // println!("parquet: {:?}", df.clone());
     // println!("parquet columns: {:?}", df.clone().get_column_names());
     
-
-
     let mut out = summary_performance(df.clone())?;
     println!("Average Performance by Strategy:\n {:?}", out);
-    
+
     let datetag = df.column("date")?
         .get(0)?
         .to_string()
@@ -200,6 +245,7 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
         .replace("-", "");
 
     let tag: &str = if stocks { "stocks" } else { "crypto" };
+    // let tag: &str = &univ.join("_");
 
     let perf_filename = if production { 
         format!("{}/performance/{}_all_{}.csv", path, tag, &datetag) 
@@ -265,22 +311,22 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
             .filter(col("buy").eq(lit(1)))
             .sort(vec!["ticker"], SortMultipleOptions {descending: vec![false], ..Default::default()})
             .collect()?;
-
+ 
         let mut sells = df_b.lazy()
             .filter(col("sell").eq(lit(-1)))
             .sort(vec!["ticker"], SortMultipleOptions {descending: vec![false], ..Default::default()})
             .collect()?;
-
+ 
         let buy_filename = format!("{}/performance/{}_buys_{}.csv", path, tag, datetag);
         let mut buy_file = File::create(buy_filename)?;
         let _ = CsvWriter::new(&mut buy_file).finish(&mut buys);
-    
+     
         let sell_filename = format!("{}/performance/{}_sells_{}.csv", path, tag, datetag);
         let mut sell_file = File::create(sell_filename)?;
         let _ = CsvWriter::new(&mut sell_file).finish(&mut sells);
     
     };
-
+    
     // only show for testing
     if !production {
 
@@ -358,7 +404,7 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
             Err(ref e) => println!("Error filtering DataFrame for Micro: \n{:?}", e),
         }
     }
-
+    
     Ok(datetag)
 }
 
@@ -391,7 +437,7 @@ pub async fn sig(df: LazyFrame, signal: &Signal) -> Result<Backtest, Box<dyn Std
     let func = &signal.f;
     let s = func(df.clone().collect()?);
     let bt = backtest_performance(df.collect()?, s, &signal.name)?;
-    println!("bt_sig: {:?}", bt.clone());
+    // println!("bt_sig: {:?}", bt.clone());
     Ok(bt)
 }
 
@@ -482,20 +528,37 @@ pub fn backtest_performance(df: DataFrame, side: BuySell, strategy: &str) -> Res
     let total_net_losses: Vec<f64> = total_result.clone().into_iter().filter(|&x| x < 0.0).collect();
     let sum_total_net_profits = total_net_profits.iter().sum::<f64>();
     let sum_total_net_losses = total_net_losses.iter().sum::<f64>().abs();
-    let profit_factor = f64::min(999., sum_total_net_profits / sum_total_net_losses);
+    let profit_factor: f64 = {
+        let pf = sum_total_net_profits / sum_total_net_losses;
+        if pf.is_nan() {0.0} else {f64::min(999.0, pf)}
+    };
 
     // Hit ratio    
-    let hit_ratio: f64 = (total_net_profits.len() as f64 / (total_net_losses.len() + total_net_profits.len()) as f64) * 100.0;
+    let hit_ratio: f64 = {
+        let hr = (total_net_profits.len() as f64 / (total_net_losses.len() + total_net_profits.len()) as f64) * 100.0;
+        if hr.is_nan() {0.0} else {f64::min(100., hr)}
+    };
 
     // Risk reward ratio
-    let average_gain = sum_total_net_profits / total_net_profits.len() as f64;
-    let average_loss = sum_total_net_losses / total_net_losses.len() as f64;
-    let realized_risk_reward = average_gain / average_loss;
-
+    let average_gain: f64 = {
+        let ag = sum_total_net_profits / total_net_profits.len() as f64;
+        if ag.is_nan() {0.0} else {f64::min(100., ag)}
+    };
+    let average_loss: f64 = {
+        let al = sum_total_net_losses / total_net_losses.len() as f64;
+        if al.is_nan() {0.0} else {f64::max(-100., al)}
+    };
+    let realized_risk_reward: f64 = {
+        let rr = average_gain / average_loss;
+        if rr.is_nan() {0.0} else {f64::min(100., rr)}
+    };
     let trades: i32 = total_result.clone().into_iter().filter(|&x| x != 0.0).collect::<Vec<_>>().len() as i32;
         
     // Expectancy
-    let expectancy  = (average_gain * hit_ratio) - ((1. - hit_ratio) * average_loss);
+    let expectancy  = {
+        let ex = (average_gain * hit_ratio) - ((100. - hit_ratio) * average_loss);
+        if ex.is_nan() {0.0} else {f64::min(999., ex)}
+    };
 
     let max_gain = total_net_profits.into_iter().max_by(|a, b| a.partial_cmp(b).unwrap());
     let max_loss = total_net_losses.into_iter().min_by(|a, b| a.partial_cmp(b).unwrap());
@@ -505,14 +568,34 @@ pub fn backtest_performance(df: DataFrame, side: BuySell, strategy: &str) -> Res
 
     let buy = side.buy[len-1];
     let sell = side.sell[len-1];
-    let pos_conf = 0.0; //df.pos_conf[len-1];
-    let neg_conf = 0.0; //df.neg_conf[len-1];
-    let ticker1 = df.column("Ticker").unwrap().get(0).unwrap().to_string();
-    let ticker = ticker1.trim_matches('"').to_string();
+    let pos_conf = {
+        if let Some(pos) = side.pos_conf.get(len - 1) {
+            if pos.is_nan() {
+                0.0
+            } else {
+                *pos
+            }
+        } else {
+            0.0 // Fallback if pos_conf is Null
+        }
+    };
+    let neg_conf = {
+        if let Some(neg) = side.neg_conf.get(len - 1) {
+            if neg.is_nan() {
+                0.0
+            } else {
+                *neg
+            }
+        } else {
+            0.0 // Fallback if pos_conf is Null
+        }
+    };    
+    let quoted_ticker = df.column("Ticker").unwrap().get(0).unwrap().to_string();
+    let ticker = quoted_ticker.trim_matches('"').to_string();
     let universe1 = df.column("Universe").unwrap().get(0).unwrap().to_string();
     let universe = universe1.trim_matches('"').to_string();
-    let date1 = df.column("Date").unwrap().get(len-1).unwrap().to_string();
-    let date = date1.trim_matches('"').to_string();
+    let quoted_date = df.column("Date").unwrap().get(len-1).unwrap().to_string();
+    let date = quoted_date.trim_matches('"').to_string();
     // println!("finished {} signal {:?}", ticker, strategy);
 
     Ok(Backtest {
@@ -561,6 +644,8 @@ pub fn showbt(bt: Backtest) -> Result<(), Box<dyn StdError>> {
     println!("Buys:             {:.1}", bt.buys);
     println!("Sells:            {:.1}", bt.sells);
     println!("Trades:           {:.1}", bt.trades);
+    println!("Pos Conf:         {:.1}", bt.pos_conf);
+    println!("Neg Conf:         {:.1}", bt.neg_conf);
     Ok(())
 }
 

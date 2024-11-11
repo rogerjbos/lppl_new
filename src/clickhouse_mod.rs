@@ -146,23 +146,52 @@ pub async fn get_ch_cloud_client() -> Result<Client, Box<dyn StdError>> {
 
 pub async fn get_ch_client() -> Result<Client, Box<dyn StdError>> {
     let client = Client::default()
-        .with_url("http://192.168.86.73:8123")
-        .with_user(read_env_var("CLICKHOUSE_USER"))
-        .with_password(read_env_var("CLICKHOUSE_PASSWORD"))
+        .with_url("http://32.218.212.45:8123")
+        .with_user("roger")
+        .with_password(read_env_var("PG"))
         .with_database("tiingo");
     let query_result = client.query("SELECT version()").fetch_one::<String>().await;
 
     match query_result {
         Ok(version) => {
-            println!("Successfully connected to ClickHouse. Server version: {}", version);
-            Ok(client)  // Connection is successful
+            println!("Successfully connected to ClickHouse Remote. Server version: {}", version);
+            Ok(client)
         }
         Err(e) => {
-            println!("Failed to connect to ClickHouse: {:?}", e);
-            Err(Box::new(e))  // Propagate the error
+            println!("Failed to connect to ClickHouse Remote: {:?}", e);
+            Err(Box::new(e))
         }
     }    
 }
+
+// #[derive(Clone, Debug, Row, Serialize, Deserialize)]
+// struct Score {
+//     date: i64,
+//     universe: String,
+//     ticker: String,
+//     strategy: String,
+//     // side: i64,
+//     // risk_reward: f64,
+//     // expectancy: f64,
+//     // profit_factor: f64,
+//     buy: i64,
+//     sell: i64,
+//     pos_conf: f64,
+//     neg_conf: f64
+// }
+
+#[derive(Clone, Debug, Row, Serialize)]
+struct Score {
+    date: String,
+    universe: String,
+    ticker: String,
+    strategy: String,
+    buy: i64,
+    sell: i64,
+    pos_conf: f64,
+    neg_conf: f64
+}
+
 
 pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdError>> {
 
@@ -171,56 +200,47 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
     let date_column = df.column("date")?.date()?;
     let universe_column = df.column("universe")?.str()?;
     let ticker_column = df.column("ticker")?.str()?;
-    let side_column = df.column("side")?.i64()?;
-    let risk_reward_column = df.column("risk_reward")?.f64()?;
-    let expectancy_column = df.column("expectancy")?.f64()?;
-    let profit_factor_column = df.column("profit_factor")?.f64()?;
+    let strategy_column = df.column("strategy")?.str()?;
+    let buy_column = df.column("buy")?.i64()?;
+    let sell_column = df.column("sell")?.i64()?;
+    let pos_conf_column = df.column("pos_conf")?.f64()?;
+    let neg_conf_column = df.column("neg_conf")?.f64()?;
     
-    let mut insert = client.insert("strategy_score")?;
+    let mut insert = client.insert("lppl_score")?;
     for i in 0..df.height() {
-        let date_days = date_column.get(i).unwrap();  // Number of days since 1970-01-01
-        let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("date") + Duration::days(date_days as i64);
-        let naive_datetime = naive_date.and_hms_opt(0, 0, 0).expect("date").and_utc().timestamp() * 1000;
-        // let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("date") + Duration::days(date_days as i64);
-        // let naive_datetime = naive_date.and_hms_opt(0, 0, 0).expect("date").and_utc().timestamp() * 1000;
+        let date_days = date_column.get(i).unwrap();
+        let naive_date = NaiveDate::from_ymd(1970, 1, 1) + Duration::days(date_days as i64);
+        let date_str = naive_date.to_string();
 
         let row = Score {
-            date: naive_datetime,
+            date: date_str,
             universe: universe_column.get(i).unwrap().to_string(),
             ticker: ticker_column.get(i).unwrap().to_string(),
-            side: side_column.get(i).unwrap(),
-            risk_reward: risk_reward_column.get(i).unwrap(),
-            expectancy: expectancy_column.get(i).unwrap(),
-            profit_factor: profit_factor_column.get(i).unwrap(),
+            strategy: strategy_column.get(i).unwrap().to_string(),
+            buy: buy_column.get(i).unwrap(),
+            sell: sell_column.get(i).unwrap(),
+            pos_conf: pos_conf_column.get(i).unwrap(),
+            neg_conf: neg_conf_column.get(i).unwrap(),
         };
+        // println!("row: {:?}", row.clone());
         insert.write(&row).await?;
     }
     insert.end().await?;
     Ok(())
 }
 
-#[derive(Debug, Row, Serialize, Deserialize)]
-struct Score {
-    date: i64,
-    universe: String,
-    ticker: String,
-    side: i64,
-    risk_reward: f64,
-    expectancy: f64,
-    profit_factor: f64
-}
-
-async fn _create_score_table() -> Result<(), Box<dyn StdError>> {
+pub async fn create_score_table() -> Result<(), Box<dyn StdError>> {
 
     let client = get_ch_client().await?;
-    let txt: &str = "CREATE OR REPLACE TABLE strategy_score (
+    let txt: &str = "CREATE OR REPLACE TABLE tiingo.lppl_score (
         date String,
         universe LowCardinality(String),
         ticker LowCardinality(String),
-        side Int64,
-        risk_reward Float64,
-        expectancy Float64,
-        profit_factor Float64 )
+        strategy LowCardinality(String),
+        buy Int64,
+        sell Int64,
+        pos_conf Float64,
+        neg_conf Float64 )
     ENGINE = ReplacingMergeTree
     ORDER BY ticker";
     let _ = client.query(&txt).execute().await;
