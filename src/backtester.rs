@@ -77,22 +77,31 @@ pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
     let neg = df.column("neg_conf").unwrap().f64().unwrap(); 
     let _close = df.column("Close").unwrap().f64().unwrap(); 
 
+    // println!("df: {:?}", df.clone());
+
     for i in 1..len-1 {
-        let pos_0 = pos.get(i).unwrap();
-        let _pos_1 = pos.get(i-1).unwrap();
-        let neg_0 = neg.get(i).unwrap();
-        let _neg_1 = neg.get(i-1).unwrap();
-        if pos_0 > pos_level
-            {
-                sell[i + 1] = 1;
-            }
-        else if neg_0 > neg_level
-            {
-                buy[i + 1] = -1;
-            }
+        let pos_0: f64;
+        let neg_0: f64;
+        if i == len-2 {
+            pos_0 = pos.get(i+1).unwrap();
+            neg_0 = neg.get(i+1).unwrap();
+            // println!("pos {}  neg {}", pos_0, neg_0);
+        } else {
+            pos_0 = pos.get(i).unwrap();
+            neg_0 = neg.get(i).unwrap();
+        }
+        // println!("i of {} : {} pos {} neg {}", i, len.clone(), pos_0, neg_0);
+
+        if pos_0 > pos_level {
+            sell[i + 1] = -1;
+            // println!("sell triggered {} > {}", neg_0, neg_level);
+        } else if neg_0 > neg_level {
+            buy[i + 1] = 1;
+            // println!("buy triggered {} > {}", neg_0, neg_level);
+        }
         pos_conf[i + 1] = pos_0 as f32;
         neg_conf[i + 1] = neg_0 as f32;
-        
+    
     }
     BuySell { buy, sell , pos_conf, neg_conf }
 }
@@ -123,7 +132,7 @@ async fn concat_dataframes(dfs: Vec<DataFrame>) -> Result<DataFrame, PolarsError
     }
 
     // For debugging, print details of incompatible DataFrames (up to 3) versus reference
-    for (i, (df, schema)) in incompatible_dfs.iter().enumerate() {
+    for (i, (_df, schema)) in incompatible_dfs.iter().enumerate() {
         if i==0 {
             println!("reference_schema: {:?}", reference_schema);
         }
@@ -171,7 +180,7 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
     let mut a: Vec<DataFrame> = Vec::new();
     let mut b: Vec<DataFrame> = Vec::new();
     let mut entries = fs::read_dir(&dir_path).await?;
-    println!("summary performance dir_path: {}", &dir_path);
+    // println!("summary performance dir_path: {}", &dir_path);
 
     while let Some(entry) = entries.next_entry().await? {
 
@@ -234,29 +243,31 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
     let df = concat_dataframes(a).await?;
     // println!("parquet: {:?}", df.clone());
     // println!("parquet columns: {:?}", df.clone().get_column_names());
-    
-    let mut out = summary_performance(df.clone())?;
-    println!("Average Performance by Strategy:\n {:?}", out);
 
+    let mut out = summary_performance(df.clone())?;
     let datetag = df.column("date")?
         .get(0)?
         .to_string()
         .trim_matches('"')
         .replace("-", "");
-
     let tag: &str = if stocks { "stocks" } else { "crypto" };
-    // let tag: &str = &univ.join("_");
 
-    let perf_filename = if production { 
-        format!("{}/performance/{}_all_{}.csv", path, tag, &datetag) 
-    } else {
-        format!("{}/performance/{}_testing.csv", path, tag) 
-    };
+    // show and save performance only for testing 
+    if !production {
+        println!("Average Performance by Strategy:\n {:?}", out);
+        // let tag: &str = &univ.join("_");
 
-    let mut file = File::create(perf_filename)?;
-    let _ = CsvWriter::new(&mut file).finish(&mut out);
+        let perf_filename = if production { 
+            format!("{}/performance/{}_all_{}.csv", path, tag, &datetag) 
+        } else {
+            format!("{}/performance/{}_testing.csv", path, tag) 
+        };
 
-    // coverage
+        let mut file = File::create(perf_filename)?;
+        let _ = CsvWriter::new(&mut file).finish(&mut out);
+    }
+
+    // show coverage
     if production {
 
         // concat all the price dfs 
@@ -284,7 +295,7 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
             let grouped = tmp.group_by_stable([col("Ticker")])
                 .agg([ 
                     col("Date").count().alias("observations"),
-                    col("Date").last().alias("last date") 
+                    col("Date").last().alias("last date"),
                 ])
                 .sort(vec!["Ticker"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
 
@@ -298,9 +309,9 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
 
         let both = all_p.lazy()
             .inner_join(df_grouped, col("Ticker"), col("ticker"))
-            .filter(
-                col("strategies").lt(lit(121))
-            )
+            // .filter(
+            //     col("strategies").lt(lit(121))
+            // )
             .sort(vec!["strategies"], SortMultipleOptions {descending: vec![false], ..Default::default()})
             .collect();
         println!("Strategy Coverage: {:?}", both);

@@ -31,7 +31,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
         SELECT baseCurrency ticker, max(date) maxdate
         FROM crypto
         group by ticker
-        having count(date) > 250 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
+        having count(date) > 130 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
         )
         SELECT date(p.date) Date, u.ticker Ticker, 'Crypto' as Universe,
         open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
@@ -39,7 +39,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
         INNER JOIN univ u
         ON u.ticker = p.baseCurrency
         WHERE p.date >= subtractDays(now(), 250)
-        and maxdate IN (select max(date) from crypto)
+        and maxdate IN (select max(date) from crypto) AND NOT match(u.ticker, '\\d[ls]$')
         order by ticker, date".to_string()
     } else if production && univ != "Crypto"{ format!("WITH mdate AS (
         SELECT symbol, max(date(date)) AS maxdate
@@ -47,7 +47,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
         INNER JOIN univ u
         ON p.symbol = u.Ticker and u.batch ='{univ}'
         group by symbol
-        having count(date) >= 250 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
+        having count(date) >= 130 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
         )
         SELECT date(p.date) Date
         , symbol AS Ticker
@@ -74,7 +74,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
         FROM crypto p
         INNER JOIN univ u
         ON u.ticker = p.baseCurrency
-        WHERE date > '2020-01-01'
+        WHERE date > '2020-01-01' AND NOT match(u.ticker, '\\d[ls]$')
         order by ticker, date".to_string()
     } else if !production && univ != "Crypto" { format!("WITH mdate AS (
         SELECT symbol, max(date(date)) AS maxdate
@@ -164,30 +164,16 @@ pub async fn get_ch_client() -> Result<Client, Box<dyn StdError>> {
     }    
 }
 
-// #[derive(Clone, Debug, Row, Serialize, Deserialize)]
-// struct Score {
-//     date: i64,
-//     universe: String,
-//     ticker: String,
-//     strategy: String,
-//     // side: i64,
-//     // risk_reward: f64,
-//     // expectancy: f64,
-//     // profit_factor: f64,
-//     buy: i64,
-//     sell: i64,
-//     pos_conf: f64,
-//     neg_conf: f64
-// }
-
 #[derive(Clone, Debug, Row, Serialize)]
 struct Score {
     date: String,
     universe: String,
     ticker: String,
-    strategy: String,
-    buy: i64,
-    sell: i64,
+    // strategy: String,
+    side: i64,
+    risk_reward: f64,
+    expectancy: f64,
+    profit_factor: f64,
     pos_conf: f64,
     neg_conf: f64
 }
@@ -200,25 +186,30 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
     let date_column = df.column("date")?.date()?;
     let universe_column = df.column("universe")?.str()?;
     let ticker_column = df.column("ticker")?.str()?;
-    let strategy_column = df.column("strategy")?.str()?;
-    let buy_column = df.column("buy")?.i64()?;
-    let sell_column = df.column("sell")?.i64()?;
+    // let strategy_column = df.column("strategy")?.str()?;
+    let side_column = df.column("side")?.i64()?;
+    let risk_reward_column = df.column("risk_reward")?.f64()?;
+    let expectancy_column = df.column("expectancy")?.f64()?;
+    let profit_factor_column = df.column("profit_factor")?.f64()?;
     let pos_conf_column = df.column("pos_conf")?.f64()?;
     let neg_conf_column = df.column("neg_conf")?.f64()?;
     
     let mut insert = client.insert("lppl_score")?;
     for i in 0..df.height() {
         let date_days = date_column.get(i).unwrap();
-        let naive_date = NaiveDate::from_ymd(1970, 1, 1) + Duration::days(date_days as i64);
+        let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1)
+            .expect("Invalid base date")
+            + Duration::days(date_days as i64);
         let date_str = naive_date.to_string();
-
         let row = Score {
             date: date_str,
             universe: universe_column.get(i).unwrap().to_string(),
             ticker: ticker_column.get(i).unwrap().to_string(),
-            strategy: strategy_column.get(i).unwrap().to_string(),
-            buy: buy_column.get(i).unwrap(),
-            sell: sell_column.get(i).unwrap(),
+            // strategy: strategy_column.get(i).unwrap().to_string(),
+            side: side_column.get(i).unwrap(),
+            risk_reward: risk_reward_column.get(i).unwrap(),
+            expectancy: expectancy_column.get(i).unwrap(),
+            profit_factor: profit_factor_column.get(i).unwrap(),
             pos_conf: pos_conf_column.get(i).unwrap(),
             neg_conf: neg_conf_column.get(i).unwrap(),
         };
@@ -236,9 +227,10 @@ pub async fn create_score_table() -> Result<(), Box<dyn StdError>> {
         date String,
         universe LowCardinality(String),
         ticker LowCardinality(String),
-        strategy LowCardinality(String),
-        buy Int64,
-        sell Int64,
+        side Int64,
+        risk_reward Float64,
+        expectancy Float64,
+        profit_factor Float64,
         pos_conf Float64,
         neg_conf Float64 )
     ENGINE = ReplacingMergeTree

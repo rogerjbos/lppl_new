@@ -28,8 +28,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let production = production_str == "production";
     let univ: &[&str] = match univ_str {
         "SC" => &["SC1", "SC2", "SC3", "SC4"],
-        "MC" => &["MC1", "MC2"],
-        //"MC" => &["MC1"],
+        //"MC" => &["MC1", "MC2"],
+        "MC" => &["MC1"],
         "LC" => &["LC1", "LC2"],
         "Micro" => &["Micro1", "Micro2", "Micro3", "Micro4"],
         "Stocks" => &["SC1", "SC2", "SC3", "SC4","MC1", "MC2","LC1", "LC2","Micro1", "Micro2", "Micro3", "Micro4"],
@@ -39,8 +39,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .collect();
 
     let overwrite = true; // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
-    let run_prices = true;
-    let run_fits = true;
+    let run_prices = false;
+    let run_fits = false;
     let run_backtests = true;
     let run_performance = true;
 
@@ -79,19 +79,19 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         for u in univ {
             let _ = backtest_helper(path.to_string(), u, batch_size, production).await;
         }
-        println!("All Backtest done");
+        println!("All Backtests done");
     }
 
     // SHOW AGGREGATED RESULTS BY STRATEGY
     // save csv files to /performance
     if run_performance {
         if overwrite {
-            let folder = format!("{}/performance/MC.csv", path);
+            let folder = format!("{}/performance/{}.csv", path, univ_str);
             // println!("folder: {}", folder);
             delete_all_files_in_folder(folder).await?;
         }
         let datetag = summary_performance_file((&path).to_string(), production, univ_vec.clone()).await?;
-        // println!("summary done");
+        println!("Done with summary for {}", datetag);
     
         if production {
             let stocks = if univ.contains(&"Crypto") { false } else { true };
@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     .collect();
                 println!("{} risk_reward: {:?}", &u, rr);
 
-                let hr = lf.clone()
+                let hr = lf
                     .filter(col("universe").eq(lit(&*u)))
                     .sort(vec!["hit_ratio"], SortMultipleOptions {descending: vec![false], ..Default::default()})
                     .tail(5)
@@ -125,4 +125,3 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     }
     Ok(())
 }
-

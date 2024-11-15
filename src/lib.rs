@@ -165,7 +165,7 @@ pub fn compute_nested_fits(
                 }
             } else {
                 println!("Panic occurred at i: {} j: {}, skipping...", i, j);
-                continue;
+                break;
             }
         }
     }
@@ -358,9 +358,8 @@ pub async fn run_fits(lf: LazyFrame, tag: &str) -> Result<(), Box<dyn StdError>>
     };
 
     // For testing use all the data, for production only use the last 120 days
-    let df = if tag=="testing" {lf.collect()?} else {lf.collect()?.tail(Some(200))};
-    // println!("tag: {}", tag);
-    // let df = lf.collect()?;
+    let df = if tag=="testing" {lf.collect()?} else {lf.collect()?.tail(Some(120))};
+    // println!("df: {}", df.clone());
 
     let ticker1 = df.column("Ticker").unwrap().get(0).unwrap().to_string();
     let ticker = ticker1.trim_matches('"').to_string();
@@ -393,6 +392,8 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
 
     let production_str = if production {"production"} else {"testing"};
     let df = lf.collect()?;
+    // println!("df: {:?}", df.clone());
+
     let ticker1 = df.column("Ticker").unwrap().get(0).unwrap().to_string();
     let ticker = ticker1.trim_matches('"').to_string();
     let universe1 = df.column("Universe").unwrap().get(0).unwrap().to_string();
@@ -441,33 +442,55 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
 
         if !production { // testing
 
-            for i in (10..=80).step_by(5) {
-                for j in (10..=80).step_by(5) {
-                    let param1 = i as f64 / 100.;
-                    let param2 = j as f64 / 100.;
-                    let name = format!("test_{}_{}", param1, param2).to_string();
-            
+            let values: Vec<f64> = std::iter::once(0.01)
+                .chain((5..=80).step_by(5).map(|x| x as f64 / 100.0))
+                .collect();
+        
+            for i in &values {
+                for j in &values {
+                    let param1 = *i;
+                    let param2 = *j;
+                       let name = format!("lppl_{:.2}_{:.2}", param1, param2);
+
                     // Use a closure to capture param1 and param2
                     let function_with_params = move |df: DataFrame| -> BuySell {
                         signal_fun(df, param1, param2)
                     };
-            
+
                     signals.push(Signal {
-                        name: name,
-                        param1: param1,
-                        param2: param2,
+                        name,
+                        param1,
+                        param2,
                         f: Arc::new(function_with_params), // Store the closure in the Arc
                     });
                 }
             }
         } else { // production
-            // test_0.12_0.46 ┆ SC1      ┆ 46.155316 ┆ 4.181794 
-            // test_0.28_0.25 ┆ SC2      ┆ 40.90177  ┆ 1.601179   
-            // test_0.18_0.53 ┆ SC3      ┆ 41.723695 ┆ 3.04542  
-            // test_0.54_0.21 ┆ SC4      ┆ 33.617785 ┆ 1.800258 
+            
+            // Miniimum confidence to be included in the buy / sell list
+            let param1: f64 = 0.01;
+            let param2: f64 = 0.01;
+            let name = format!("lppl_{}_{}", param1, param2).to_string();
+
+            // Use a closure to capture param1 and param2
+            let function_with_params = move |df: DataFrame| -> BuySell {
+                signal_fun(df, param1, param2)
+            };
+
+            signals.push(Signal {
+                name: name,
+                param1: param1,
+                param2: param2,
+                f: Arc::new(function_with_params),
+            });
+            
+            // test_0.30_0.35 ┆ SC1      ┆ 36.578564 ┆ 11.066745 
+            // test_0.55_0.15 ┆ SC2      ┆ 42.191429 ┆ 12.152326    
+            // test_0.50_0.20 ┆ SC3      ┆ 36.69196  ┆ 10.919277 
+            // test_0.5_0.15  ┆ SC4      ┆ 48.378861 ┆ 13.336275 
             if tag == "sc" || tag == "SC1" || tag == "SC2" || tag == "SC3" || tag == "SC4" {
-                let param1: f64 = 0.12;
-                let param2: f64 = 0.46;
+                let param1: f64 = 0.3;
+                let param2: f64 = 0.35;
                 let name = format!("lppl_{}_{}", param1, param2).to_string();
         
                 // Use a closure to capture param1 and param2
@@ -483,12 +506,12 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 });
 
             } else if tag == "micro" || tag == "Micro1" || tag == "Micro2" || tag == "Micro3" || tag == "Micro4" {
-                // test_0.49_0.14 ┆ Micro1   ┆ 46.883224 ┆ 2.304402 
-                // test_0.61_0.17 ┆ Micro2   ┆ 43.252537 ┆ 1.978238
-                // test_0.12_0.8  ┆ Micro3   ┆ 36.512912 ┆ 1.42087
-                // test_0.13_0.61 ┆ Micro4   ┆ 38.801067 ┆ 1.517745 
-                let param1: f64 = 0.49;
-                let param2: f64 = 0.14;
+                // test_0.5_0.35  ┆ Micro2   ┆ 29.86627  ┆ 10.916309  
+                // test_0.3_0.5   ┆ Micro3   ┆ 30.29165  ┆ 12.218928 
+                // test_0.1_0.35  ┆ Micro3   ┆ 50.537557 ┆ 4.311322 
+                // test_0.1_0.25  ┆ Micro4   ┆ 50.554766 ┆ 2.709106 
+                let param1: f64 = 0.30;
+                let param2: f64 = 0.45;
                 let name = format!("lppl_{}_{}", param1, param2).to_string();
         
                 // Use a closure to capture param1 and param2
@@ -504,9 +527,9 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 });
 
             } else if tag == "mc" || tag == "MC1" || tag == "MC2" {
-                // test_0.27_0.52 ┆ MC1      ┆ 35.581426 ┆ 4.484449  
-                // test_0.39_0.24 ┆ MC2      ┆ 41.244379 ┆ 1.427864
-                let param1: f64 = 0.4;
+                // test_0.25_0.5  ┆ MC1      ┆ 36.816127 ┆ 13.128551  
+                // test_0.4_0.2   ┆ MC2      ┆ 45.433193 ┆ 11.01682 
+                let param1: f64 = 0.35;
                 let param2: f64 = 0.25;
                 let name = format!("lppl_{}_{}", param1, param2).to_string();
 
@@ -523,10 +546,10 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 });
 
             } else if tag == "lc" || tag == "LC1" || tag == "LC2" {
-                // test_0.52_0.29 ┆ LC1      ┆ 28.66732  ┆ 3.38199 
-                // test_0.46_0.31 ┆ LC2      ┆ 31.706149 ┆ 1.442278  
-                let param1: f64 = 0.45;
-                let param2: f64 = 0.3;
+                // test_0.5_0.25  ┆ LC1      ┆ 36.426602 ┆ 11.894859   
+                // test_0.45_0.2  ┆ LC2      ┆ 42.713674 ┆ 12.48582  
+                let param1: f64 = 0.30;
+                let param2: f64 = 0.01;
                 let name = format!("lppl_{}_{}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
@@ -542,8 +565,9 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                 });
             
             } else if tag == "crypto" || tag == "Crypto" {
-                let param1: f64 = 0.01; // check these
-                let param2: f64 = 0.01;
+                // test_0.55_0.65 ┆ Crypto   ┆ 29.011567 ┆ 11.219062 
+                let param1: f64 = 0.55;
+                let param2: f64 = 0.65;
                 let name = format!("lppl_{}_{}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
@@ -557,6 +581,7 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
                     param2: param2,
                     f: Arc::new(function_with_params),
                 });
+
             }
         }
         // println!("tag: {} signals: {:?}", tag, signals);  
@@ -564,7 +589,6 @@ pub async fn run_backtests(lf: LazyFrame, tag: &str, production: bool) -> Result
     } else {
         return Err(Box::<dyn std::error::Error>::from("Fit file missing"));
     }
-
 }
 
 pub async fn backtest_helper(path: String, u: &str, batch_size: usize, production: bool) -> Result<(), Box<dyn StdError>> {
@@ -615,7 +639,10 @@ pub async fn backtest_helper(path: String, u: &str, batch_size: usize, productio
         .filter(|ticker| !filenames_set.contains(ticker))
         // .take(5) // used for testing purposes
         .collect();
-    
+    // let needed = ["00".to_string(), "ada".to_string(), "dot".to_string()];
+    // let needed = ["MAC".to_string(), "CNK".to_string(), "RDN".to_string()];
+    // println!("needed: {:?}", &needed);
+
     let out_of = needed.len();
     let mut remaining = out_of;
 
@@ -680,6 +707,8 @@ pub async fn score(datetag: &str, stocks: bool) -> Result<(), Box<dyn StdError>>
     // println!("tag: {}", &tag);
     let file_path = format!("{}/{}_testing.csv", path, tag);
     // println!("file_path: {}", &file_path);
+    let testing = LazyCsvReader::new(file_path).finish()?;
+    // println!("testing: {:?}", testing.clone().collect());
 
     // Manually create the schema and add fields
     let mut buysell_schema = Schema::with_capacity(8);
@@ -692,8 +721,6 @@ pub async fn score(datetag: &str, stocks: bool) -> Result<(), Box<dyn StdError>>
     buysell_schema.with_column("pos_conf".into(), DataType::Float64);
     buysell_schema.with_column("neg_conf".into(), DataType::Float64);
     let buysell_schema = Arc::new(buysell_schema);
-    
-    let testing = LazyCsvReader::new(file_path).finish()?;
 
     // read in the buys
     let buy_path = format!("{}/{}_buys_{}.csv", path, tag, datetag);
@@ -701,25 +728,45 @@ pub async fn score(datetag: &str, stocks: bool) -> Result<(), Box<dyn StdError>>
         .with_schema(Some(buysell_schema.clone()))
         .with_has_header(true)
         .finish()?
+        .join(testing.clone(), vec![col("strategy"), col("universe")], vec![col("strategy"), col("universe")], JoinType::Left.into())
+        .group_by_stable([col("date"), col("universe"), col("ticker")])
+        .agg([
+            col("buy").sum().alias("side"),
+            col("risk_reward").sum().alias("risk_reward"),
+            col("expectancy").sum().alias("expectancy"),
+            col("profit_factor").sum().alias("profit_factor"),
+            col("pos_conf").mean().alias("pos_conf"),
+            col("neg_conf").mean().alias("neg_conf"),
+        ])
         .sort(vec!["neg_conf"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
-    // println!("buys: {:?}", buys.clone().collect());
 
     // read in the sells
     let sell_path = format!("{}/{}_sells_{}.csv", path, tag, datetag);
     let sells = LazyCsvReader::new(sell_path)
-        .with_schema(Some(buysell_schema.clone()))
+        .with_schema(Some(buysell_schema))
         .with_has_header(true)
         .finish()?
+        .join(testing, vec![col("strategy"), col("universe")], vec![col("strategy"), col("universe")], JoinType::Left.into())
+        .group_by_stable([col("date"), col("universe"), col("ticker")])
+        .agg([
+            col("buy").sum().alias("side"),
+            col("risk_reward").sum().alias("risk_reward"),
+            col("expectancy").sum().alias("expectancy"),
+            col("profit_factor").sum().alias("profit_factor"),
+            col("pos_conf").mean().alias("pos_conf"),
+            col("neg_conf").mean().alias("neg_conf"),
+        ])
         .sort(vec!["pos_conf"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
 
     let both = concat(&[buys, sells], Default::default())?
         .sort(vec!["pos_conf","neg_conf"], SortMultipleOptions {descending: vec![false, true], nulls_last: vec![true, true], ..Default::default()})
         .collect()?;
-    // println!("both: {:?}", both);
+        // println!("both: {:?}", both);
+        // println!("both: {:?}", both.get_column_names());
 
     let path = format!("{}/rust_home/lppl_new", user_path);
     let both_path = format!("{}/score/{}_{}.csv", path, tag, datetag);
-    println!("both_path: {:?}", both_path);
+    // println!("both_path: {:?}", both_path);
     let mut file = File::create(both_path)?;
     let _ = CsvWriter::new(&mut file).finish(&mut both.clone());
 
@@ -749,70 +796,73 @@ pub async fn read_price_file(file_path: String) -> Result<LazyFrame, Box<dyn Std
 
     // READ IN PRICE FILE
     let lf: LazyFrame = LazyCsvReader::new(file_path)
-        .with_schema(Some(schema))
-        .with_has_header(true)
-        .finish()?
-        .with_column(
-            col("Date")
-                .map(
-                    |s| {
-                        let chunked = s.date()
-                            .expect("series must contain dates")
-                            .into_iter()
-                            .map(|opt_date| {
-                                opt_date.map(|days| date_to_ce(ce_to_date(days.into())))
-                            })
-                            .collect::<Float64Chunked>();
-                        Ok(Some(Series::new("time".into(), chunked)))
-                    },
-                    GetOutput::from_type(DataType::Float64),
-                )
-                .alias("time"),
-        )
-        .with_column(
-            col("Close")
-                .map(
-                    |s| {
-                        let chunked = s.f64().expect("series must contain f64 data")
-                            .into_iter()
-                            .map(|opt_price| {
-                                opt_price.map(|price| (1. + price).ln())
-                            })
-                            .collect::<Float64Chunked>();
-                        Ok(Some(Series::new("price_ln".into(), chunked)))
-                    },
-                    GetOutput::from_type(DataType::Float64),
-                )
-                .alias("price_ln"),
-        )
-       .with_column(
-            col("Close")
-                .map(
-                    |s| {
-                        let chunked = s.f64().expect("series must contain f64 data");
-                        let values: Vec<f64> = chunked.into_iter().map(|opt_price| opt_price.unwrap_or(0.0)).collect();
-                        let scaled = min_max_scale_vec(&values);
-                        Ok(Some(Series::new("scaled_price".into(), scaled)))
-                    },
-                    GetOutput::from_type(DataType::Float64),
-                )
-                .alias("scaled_price"),
-        )
-        .with_column(
-            col("Close")
-                .map(
-                    |s| {
-                        let chunked = s.f64().expect("series must contain f64 data");
-                        let values: Vec<f64> = chunked.into_iter().map(|opt_price| opt_price.unwrap_or(0.0)).collect();
-                        let scaled = min_max_scale_vec(&values);
-                        let scaled_ln: Vec<f64> = scaled.iter().map(|x| (1. + x).ln()).collect();
-                        Ok(Some(Series::new("scaled_price_ln".into(), scaled_ln)))
-                    },
-                    GetOutput::from_type(DataType::Float64),
-                )
-                .alias("scaled_price_ln"),
-        );
- 
+    .with_schema(Some(schema))
+    .with_has_header(true)
+    .finish()?
+    .with_column(
+        col("Date")
+            .map(
+                |s| {
+                    let chunked = s.date()
+                        .expect("series must contain dates")
+                        .into_iter()
+                        .map(|opt_date| {
+                            opt_date.map(|days| date_to_ce(ce_to_date(days.into())))
+                        })
+                        .collect::<Float64Chunked>();
+                    Ok(Some(Series::new("time".into(), chunked)))
+                },
+                GetOutput::from_type(DataType::Float64),
+            )
+            .alias("time"),
+    )
+    .with_column(
+        // Get the minimum price and conditionally apply ln() based on its value
+        col("Close").map(
+            |s| {
+                let chunked = s.f64().expect("series must contain f64 data");
+                let min_price = chunked.min().unwrap_or(0.0);
+
+                let transformed = if min_price > 1.0 {
+                    Box::new(chunked.into_iter().map(|opt_price| opt_price.map(|price| price.ln())))
+                        as Box<dyn Iterator<Item = Option<f64>>>
+                } else {
+                    Box::new(chunked.into_iter().map(|opt_price| opt_price))
+                        as Box<dyn Iterator<Item = Option<f64>>>
+                }.collect::<Float64Chunked>();
+
+                Ok(Some(Series::new("price_ln".into(), transformed)))
+            },
+            GetOutput::from_type(DataType::Float64),
+        ).alias("price_ln"),
+    )
+    .with_column(
+        col("Close")
+            .map(
+                |s| {
+                    let chunked = s.f64().expect("series must contain f64 data");
+                    let values: Vec<f64> = chunked.into_iter().map(|opt_price| opt_price.unwrap_or(0.0)).collect();
+                    let scaled = min_max_scale_vec(&values);
+                    Ok(Some(Series::new("scaled_price".into(), scaled)))
+                },
+                GetOutput::from_type(DataType::Float64),
+            )
+            .alias("scaled_price"),
+    )
+    .with_column(
+        col("price_ln")
+            .map(
+                |s| {
+                    let chunked = s.f64().expect("series must contain f64 data");
+                    let values: Vec<f64> = chunked.into_iter().map(|opt_price| opt_price.unwrap_or(0.0)).collect();
+                    let scaled = min_max_scale_vec(&values);
+                    Ok(Some(Series::new("scaled_price_ln".into(), scaled)))
+                },
+                GetOutput::from_type(DataType::Float64),
+            )
+            .alias("scaled_price_ln"),
+    );
+
     Ok(lf)
 }
 
@@ -868,7 +918,7 @@ pub async fn fits_helper(path: String, u: &str, batch_size: usize, production: b
         .filter(|ticker| !filenames_set.contains(ticker))
         // .take(5) // used for testing
         .collect();
-    // let needed = ["akt"];
+    // let needed = ["00", "ada", "dot"];
     // println!("needed: {:?}", &needed);
 
     let out_of = needed.len();
