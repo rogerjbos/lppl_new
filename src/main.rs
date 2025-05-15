@@ -15,8 +15,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     };
     let default_path: String = format!("{}/rust_home/lppl_new", user_path);
     
-    let default_production: String = "production".to_string();
-    let default_univ = "MC".to_string();
+    let default_production: String = "testing".to_string();
+    let default_univ = "Crypto".to_string();
     let batch_size: usize = 10;
 
     // collect command line args
@@ -28,8 +28,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let production = production_str == "production";
     let univ: &[&str] = match univ_str {
         "SC" => &["SC1", "SC2", "SC3", "SC4"],
-        //"MC" => &["MC1", "MC2"],
-        "MC" => &["MC1"],
+        "MC" => &["MC1", "MC2"],
+        "MC1" => &["MC1"],
         "LC" => &["LC1", "LC2"],
         "Micro" => &["Micro1", "Micro2", "Micro3", "Micro4"],
         "Stocks" => &["SC1", "SC2", "SC3", "SC4","MC1", "MC2","LC1", "LC2","Micro1", "Micro2", "Micro3", "Micro4"],
@@ -39,18 +39,28 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .collect();
 
     let overwrite = true; // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
-    let run_prices = false;
-    let run_fits = false;
+    let run_prices = true;
+    let run_fits = true;
     let run_backtests = true;
     let run_performance = true;
 
     // GENERATE PRICE FILE FOR EACH UNIVERSE
     // saves CSV files for each universe to /data/testing or /data/production
+    println!("run_prices: {}", run_prices);
     if run_prices {
+        println!("inside run_prices: {}", run_prices);
         if overwrite {
-            delete_all_files_in_folder(format!("{}/data/{}", path, production_str)).await?;
+            // delete_all_files_in_folder(format!("{}/data/{}", path, production_str)).await?;
+            for universe in &univ_vec {
+                let file_path = format!("{}/data/{}/{}.csv", path, production_str, universe);
+                if std::path::Path::new(&file_path).exists() {
+                    std::fs::remove_file(file_path)?;
+                    println!("Deleted: {}.csv", universe);
+                }
+            }
         }
         create_price_files(univ_vec.clone(), production.clone()).await?;
+        println!("price file done");
     }
 
     // COMPUTE NESTED FITS FOR EACH UNIVERSE
@@ -87,8 +97,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     if run_performance {
         if overwrite {
             let folder = format!("{}/performance/{}.csv", path, univ_str);
-            // println!("folder: {}", folder);
-            delete_all_files_in_folder(folder).await?;
+            println!("folder: {}", folder);
+            //delete_all_files_in_folder(folder).await?;
         }
         let datetag = summary_performance_file((&path).to_string(), production, univ_vec.clone()).await?;
         println!("Done with summary for {}", datetag);

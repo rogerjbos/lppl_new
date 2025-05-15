@@ -272,12 +272,15 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
 
         // concat all the price dfs 
         let mut p: Vec<DataFrame> = Vec::new();
+        // println!("univ: {:?}", univ);
+
         // let univ = ["Crypto","LC1","LC2","MC1","MC2","SC1","SC2","SC3","SC4","Micro1","Micro2"];
         for u in univ {
             let file_path = format!("{}/data/production/{}.csv", path, u);
             // let tmp = LazyFrame::scan_parquet(file_path, ScanArgsParquet::default())?;
+            // println!("file_path: {}", file_path.clone());
             let mut schema = Schema::with_capacity(8);
-            schema.with_column("Date".into(), DataType::Date);
+            schema.with_column("Date".into(), DataType::String);
             schema.with_column("Ticker".into(), DataType::String);
             schema.with_column("Universe".into(),DataType::String);
             schema.with_column("Open".into(), DataType::Float64);
@@ -291,15 +294,30 @@ pub async fn summary_performance_file(path: String, production: bool, univ: Vec<
                 .with_schema(Some(schema))
                 .with_has_header(true)
                 .finish()?;
-        
+
+            let tmp = tmp.with_column(
+                col("Date").str().strptime(
+                    DataType::Date, // First argument: desired output data type
+                    StrptimeOptions {
+                        format: Some("%Y-%m-%d".into()),
+                        strict: false,
+                        exact: true,
+                        cache: true,
+                    },
+                    lit(NULL) // Third argument: handling for ambiguous cases, using null as default
+                ).alias("Date")
+            );
+            // println!("tmp: {:?}", tmp.clone().collect());
+            
             let grouped = tmp.group_by_stable([col("Ticker")])
                 .agg([ 
                     col("Date").count().alias("observations"),
                     col("Date").last().alias("last date"),
                 ])
                 .sort(vec!["Ticker"], SortMultipleOptions {descending: vec![false], nulls_last: vec![true], ..Default::default()});
+            // println!("grouped: {:?}", grouped.clone().collect()?);
 
-                p.push(grouped.collect().unwrap());
+            p.push(grouped.collect().unwrap());
         }
         let all_p = concat_dataframes(p).await?;
 
@@ -477,7 +495,6 @@ pub async fn run_all_backtests(df: LazyFrame, signals: Vec<Signal>) -> Result<Ve
 }
 
 pub async fn create_price_files(univ_vec: Vec<String>, production: bool) -> Result<(), Box<dyn StdError>> {
-    
     let folder = if production { "production" } else { "testing" };
 
     for u in univ_vec {

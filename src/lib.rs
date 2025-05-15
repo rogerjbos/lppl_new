@@ -667,7 +667,7 @@ pub async fn backtest_helper(path: String, u: &str, batch_size: usize, productio
                     (true, u) if u.starts_with("LC") => "lc",
                     (_, _) => "crypto",
                 };
-                println!("Running {} '{}' backtests: {} of {}", u, ticker_clone, out_of - remaining, out_of);
+                println!("LPPL running {} '{}' backtests: {} of {}", u, ticker_clone, out_of - remaining, out_of);
                 // println!("lf: {:?}", filtered_lf.clone().collect());
                 
                 match run_backtests(filtered_lf, tag, production).await {
@@ -874,7 +874,7 @@ pub async fn fits_helper(path: String, u: &str, batch_size: usize, production: b
     // println!("here 0 file_path: {:?}", &file_path);
 
     let lf = read_price_file(file_path).await?;
-    // println!("lf: {:?}", lf.clone().collect());
+    println!("lf: {:?}", lf.clone().collect());
 
     // Collect the unique tickers into a DataFrame
     let unique_tickers_df = lf.clone()
