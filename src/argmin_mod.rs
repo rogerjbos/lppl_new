@@ -2,11 +2,11 @@ use argmin::{
     core::{CostFunction, Error, Executor, State},
     solver::neldermead::NelderMead,
 };
+use nalgebra::{DMatrix, DVector as nalgebraDVector};
 use ndarray::{array, Array1};
 use rand::distributions::{Distribution, Uniform};
 use rand::thread_rng;
 use std::error::Error as StdError;
-use nalgebra::{DMatrix, DVector as nalgebraDVector};
 
 #[derive(Debug, Clone)]
 struct LpplsCostFunction {
@@ -15,15 +15,15 @@ struct LpplsCostFunction {
 }
 
 impl CostFunction for LpplsCostFunction {
-    type Param = Array1<f64>;  // Use Array1<f64> for parameters
+    type Param = Array1<f64>; // Use Array1<f64> for parameters
     type Output = f64;
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         // Use Array1<f64> directly in the cost calculation
         Ok(lppls_cost(
-            &param.to_vec(),  // Convert Array1<f64> to Vec<f64>
-            &self.time,       // Time data
-            &self.price,      // Price data
+            &param.to_vec(), // Convert Array1<f64> to Vec<f64>
+            &self.time,      // Time data
+            &self.price,     // Price data
         ))
     }
 }
@@ -82,16 +82,16 @@ pub fn matrix_equation(
         yihi += yi * hi;
     }
 
-    let matrix_1 = DMatrix::from_row_slice(4, 4, &[
-        n as f64, sum_fi, sum_gi, sum_hi,
-        sum_fi, fi_pow_2, figi, fihi,
-        sum_gi, figi, gi_pow_2, gihi,
-        sum_hi, fihi, gihi, hi_pow_2
-    ]);
+    let matrix_1 = DMatrix::from_row_slice(
+        4,
+        4,
+        &[
+            n as f64, sum_fi, sum_gi, sum_hi, sum_fi, fi_pow_2, figi, fihi, sum_gi, figi, gi_pow_2,
+            gihi, sum_hi, fihi, gihi, hi_pow_2,
+        ],
+    );
 
-    let matrix_2 = nalgebraDVector::from_row_slice(&[
-        sum_yi, yifi, yigi, yihi
-    ]);
+    let matrix_2 = nalgebraDVector::from_row_slice(&[sum_yi, yifi, yigi, yihi]);
 
     if let Some(solution) = matrix_1.lu().solve(&matrix_2) {
         let a = solution[0];
@@ -107,7 +107,7 @@ pub fn matrix_equation(
 
 // LPPLS cost function
 pub fn lppls_cost(
-    param: &[f64],  // Parameters: tc, m, w, a, b, c1, c2
+    param: &[f64], // Parameters: tc, m, w, a, b, c1, c2
     time: &[f64],
     price: &[f64],
 ) -> f64 {
@@ -143,10 +143,15 @@ pub fn lppls_cost(
 }
 
 // Fit using Argmin and Nelder-Mead
-pub fn fit_argmin(time: Vec<f64>, price: Vec<f64>) -> Result<(f64, f64, f64, f64, f64, f64, f64, f64), Box<dyn StdError>> {
-    
+pub fn fit_argmin(
+    time: Vec<f64>,
+    price: Vec<f64>,
+) -> Result<(f64, f64, f64, f64, f64, f64, f64, f64), Box<dyn StdError>> {
     // let scaled_price = min_max_scale(&price);
-    let cost = LpplsCostFunction { time: time.clone(), price: price.clone() };
+    let cost = LpplsCostFunction {
+        time: time.clone(),
+        price: price.clone(),
+    };
 
     // Generate bounds for the parameters
     let t1 = time.first().unwrap();
@@ -169,26 +174,25 @@ pub fn fit_argmin(time: Vec<f64>, price: Vec<f64>) -> Result<(f64, f64, f64, f64
     let mut retry_count = 0;
 
     loop {
-    
         // Generate initial parameter values
         let tc = tc_between.sample(&mut rng);
         let m = m_between.sample(&mut rng);
         let w = w_between.sample(&mut rng);
-    
+
         // Compute a, b, c1, c2 using matrix equation
         let (a, b, c1, c2) = matrix_equation(&time, &price, tc, m, w);
-    
+
         // Initial parameters for the LPPLS model as Array1<f64>
         let init_param = array![tc, m, w, a, b, c1, c2];
-    
+
         // Set up solver with initial vertices for Nelder-Mead
         let solver = NelderMead::new(vec![
-            init_param.clone(),  // First vertex
-            init_param.mapv(|x| x + 0.0001),  // Slightly perturbed second vertex
-            init_param.mapv(|x| x - 0.0001),  // Slightly perturbed third vertex
+            init_param.clone(),              // First vertex
+            init_param.mapv(|x| x + 0.0001), // Slightly perturbed second vertex
+            init_param.mapv(|x| x - 0.0001), // Slightly perturbed third vertex
         ])
         .with_sd_tolerance(1e-4)?;
-    
+
         // Run the optimization using Executor
         let res = Executor::new(cost.clone(), solver)
             .configure(|state| state.max_iters(100))
@@ -198,7 +202,7 @@ pub fn fit_argmin(time: Vec<f64>, price: Vec<f64>) -> Result<(f64, f64, f64, f64
         if let Some(best_params) = res.state().get_param() {
             let best_cost = res.state().get_cost();
 
-            if best_cost > (0.5*(retry_count as f32  + 1.)).into() {
+            if best_cost > (0.5 * (retry_count as f32 + 1.)).into() {
                 retry_count += 1;
                 if retry_count >= max_retries {
                     println!("Reached maximum retries. Stopping optimization.");

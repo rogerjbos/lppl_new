@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+csv = "1.1"
 rand = "0.8.5"
 num-format = "0.4.4"
 cmaes = "0.2.1"

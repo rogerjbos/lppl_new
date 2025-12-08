@@ -1,124 +1,35 @@
+use chrono::{Duration, NaiveDate};
+use clickhouse::{Client, Row};
+use csv::WriterBuilder;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{env, error::Error as StdError, fmt::Debug, process::Command};
-use clickhouse::{Client, Row};
-use chrono::{NaiveDate,  Duration};
+use std::fs::File;
+use std::{env, error::Error as StdError, fmt::Debug}; //, process::Command
+use tokio::time;
 
+// Add this enum above the client functions
+pub enum ChConnectionType {
+    Local,
+    Remote,
+}
 
 #[derive(Debug, Row, Serialize, Deserialize)]
 struct OHLCV {
     date: String,
     ticker: String,
     universe: String,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    volume: Option<f64>,
 }
 
-
-// pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<dyn StdError>> {
- 
-//     let user_path = match env::var("CLICKHOUSE_USER_PATH") {
-//         Ok(path) => path,
-//         Err(_) => String::from("/srv"),
-//     };
-//     let folder = if production { "production" } else { "testing" };
-//     let filename = format!("{}/rust_home/lppl_new/data/{}/{}.csv", user_path.to_string(), folder.to_string(), univ);
-    
-//     let query = if production && univ == "Crypto" { "WITH univ AS (
-//         SELECT baseCurrency ticker, max(date) maxdate
-//         FROM crypto
-//         group by ticker
-//         having count(date) > 130 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
-//         )
-//         SELECT date(p.date) Date, u.ticker Ticker, 'Crypto' as Universe,
-//         open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
-//         FROM crypto p
-//         INNER JOIN univ u
-//         ON u.ticker = p.baseCurrency
-//         WHERE p.date >= subtractDays(now(), 250)
-//         and maxdate IN (select max(date) from crypto) AND NOT match(u.ticker, '\\d[ls]$')
-//         order by ticker, date".to_string()
-//     } else if production && univ != "Crypto"{ format!("WITH mdate AS (
-//         SELECT symbol, max(date(date)) AS maxdate
-//         FROM usd p
-//         INNER JOIN univ u
-//         ON p.symbol = u.Ticker and u.batch ='{univ}'
-//         group by symbol
-//         having count(date) >= 130 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
-//         )
-//         SELECT date(p.date) Date
-//         , symbol AS Ticker
-//         , '{univ}' AS Universe
-//         , round(adjOpen, 2) AS Open
-//         , round(adjHigh, 2) AS High
-//         , round(adjLow, 2) AS Low
-//         , round(adjClose, 2) AS Close
-//         , round(adjVolume, 2) AS Volume
-//         FROM usd p
-//         INNER JOIN mdate m
-//         ON m.symbol = p.symbol
-//         WHERE p.date >= subtractDays(now(), 365)
-//         and m.maxdate IN (select max(date(date)) from usd)
-//         order by Ticker, date")
-//     } else if !production && univ == "Crypto" { "WITH univ AS (
-//         SELECT baseCurrency ticker, max(date) maxdate
-//         FROM crypto
-//         group by ticker
-//         having count(date) > 500 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
-//         )
-//         SELECT date(p.date) Date, u.ticker Ticker, 'Crypto' as Universe,
-//         open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
-//         FROM crypto p
-//         INNER JOIN univ u
-//         ON u.ticker = p.baseCurrency
-//         WHERE date > '2020-01-01' AND NOT match(u.ticker, '\\d[ls]$')
-//         order by ticker, date".to_string()
-//     } else if !production && univ != "Crypto" { format!("WITH mdate AS (
-//         SELECT symbol, max(date(date)) AS maxdate
-//         FROM usd p
-//         INNER JOIN univ u
-//         ON p.symbol = u.Ticker and u.batch ='{univ}'
-//         group by symbol
-//         having count(date) >= 250 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
-//         )
-//         SELECT date(p.date) Date
-//         , symbol AS Ticker
-//         , '{univ}' AS Universe
-//         , round(adjOpen, 2) AS Open
-//         , round(adjHigh, 2) AS High
-//         , round(adjLow, 2) AS Low
-//         , round(adjClose, 2) AS Close
-//         , round(adjVolume, 2) AS Volume
-//         FROM usd p
-//         INNER JOIN mdate m
-//         ON m.symbol = p.symbol
-//         WHERE p.date >= subtractDays(now(), 365)
-//         and m.maxdate IN (select max(date(date)) from usd)
-//         order by Ticker, date")
-//     } else {
-//         panic!("Error: no query match")
-//     };
-    
-//     let user = env::var("CLICKHOUSE_USER")?;
-//     let pw = env::var("CLICKHOUSE_PASSWORD")?;
-//     let cmd = format!(r#"/usr/local/bin/clickhouse-client --host='vdib5n7pan.europe-west4.gcp.clickhouse.cloud' --user='{}' --password='{}' --secure --database=tiingo -q "{}" --format=CSVWithNames > {}"#, user, pw, query, filename.clone());
-
-//     let output = Command::new("/bin/sh")
-//         .arg("-c")
-//         .arg(&cmd)
-//         .output()?;
-
-//     if !output.status.success() {
-//         eprintln!("Query failed with status: {:?}", output.status);
-//         eprintln!("stderr: {:?}", String::from_utf8_lossy(&output.stderr));
-//         return Err("Failed to execute query".into());
-//     }
-
-//     Ok(())
-// }
+// Helper struct for get_universe_tickers
+#[derive(Row, Deserialize, Debug)]
+struct TickerRow {
+    _ticker: String,
+}
 
 pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<dyn StdError>> {
     let user_path = match env::var("CLICKHOUSE_USER_PATH") {
@@ -126,46 +37,61 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
         Err(_) => String::from("/srv"),
     };
     let folder = if production { "production" } else { "testing" };
-    let filename = format!("{}/rust_home/lppl_new/data/{}/{}.csv", user_path.to_string(), folder.to_string(), univ);
-    
-    // Get the list of tickers in the universe
-    let tickers = get_universe_tickers(&univ).await?;
-    // println!("Retrieved {} tickers for universe {}", tickers.len(), univ);
-    
-    // Process in smaller chunks to reduce likelihood of connection issues
-    let chunk_size = 25; // Reduced from 100 to 25
+    let filename = format!(
+        "{}/rust_home/lppl_new/data/{}/{}.csv",
+        user_path.to_string(),
+        folder.to_string(),
+        univ
+    );
+
+    // Get the list of tickers in the universe that are already pre-filtered for validity
+    let tickers = get_universe_tickers(&univ, production).await?;
+
+    // Process in chunks of 25 tickers (reduced to avoid server memory limit)
+    let chunk_size = 25;
     let ticker_chunks: Vec<Vec<String>> = tickers
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
-    
-    println!("{} Processing {} chunks for {} tickers",univ, ticker_chunks.len(), tickers.len());
-    
-    // Create a temp file for each chunk
-    let mut temp_files = Vec::new();
-    
-    // Process each chunk with retry logic
+
+    println!(
+        "{} Processing {} chunks for {} tickers",
+        univ,
+        ticker_chunks.len(),
+        tickers.len()
+    );
+
+    // Get a client connection once
+    let client = get_ch_client(ChConnectionType::Local).await?;
+
+    // Create the final CSV file and writer once
+    let file = File::create(&filename)?;
+    let mut wtr = WriterBuilder::new().has_headers(false).from_writer(file);
+
+    // Write the header record once
+    wtr.write_record(&[
+        "Date", "Ticker", "Universe", "Open", "High", "Low", "Close", "Volume",
+    ])?;
+
+    // Process each chunk
     for (i, chunk) in ticker_chunks.iter().enumerate() {
-        let temp_filename = format!("{}.part{}", &filename, i);
-        temp_files.push(temp_filename.clone());
-        
-        // Join the ticker list
+        // Join the ticker list into a quoted, comma-separated string for SQL IN clause
         let ticker_list = chunk
             .iter()
             .map(|t| format!("'{}'", t))
             .collect::<Vec<_>>()
             .join(",");
-        
+
         println!("Processing chunk {} with {} tickers", i, chunk.len());
-        
+
         // Retry logic - try up to 3 times
-        let mut success = false;
         let mut attempts = 0;
         const MAX_ATTEMPTS: usize = 3;
-        
-        while !success && attempts < MAX_ATTEMPTS {
+        let mut chunk_success = false;
+
+        while !chunk_success && attempts < MAX_ATTEMPTS {
             attempts += 1;
-            
+
             let query = if production && univ == "Crypto" {
                 format!("WITH univ AS (
                     SELECT baseCurrency ticker, max(date) maxdate
@@ -174,7 +100,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     group by ticker
                     having count(date) > 130 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
                     )
-                    SELECT date(p.date) Date, u.ticker Ticker, 'Crypto' as Universe,
+                    SELECT toString(date(p.date)) Date, u.ticker Ticker, 'Crypto' as Universe,
                     open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
                     FROM crypto p
                     INNER JOIN univ u
@@ -183,15 +109,15 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     and maxdate IN (select max(date) from crypto) AND NOT match(u.ticker, '\\d[ls]$')
                     order by ticker, date", ticker_list)
             } else if production && univ != "Crypto" {
-                // Rest of your query logic here...
-                format!("WITH mdate AS (
+                format!(
+                    "WITH mdate AS (
                     SELECT symbol, max(date(date)) AS maxdate
                     FROM usd p
                     WHERE symbol IN ({})
                     group by symbol
                     having count(date) >= 130 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
                     )
-                    SELECT date(p.date) Date
+                    SELECT toString(date(p.date)) Date
                     , symbol AS Ticker
                     , '{univ}' AS Universe
                     , round(adjOpen, 2) AS Open
@@ -204,33 +130,37 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     ON m.symbol = p.symbol
                     WHERE p.date >= subtractDays(now(), 365)
                     and m.maxdate IN (select max(date(date)) from usd)
-                    order by Ticker, date", ticker_list)
+                    order by Ticker, date",
+                    ticker_list
+                )
             } else if !production && univ == "Crypto" {
-                // Non-production Crypto query
-                format!("WITH univ AS (
+                format!(
+                    "WITH univ AS (
                     SELECT baseCurrency ticker, max(date) maxdate
                     FROM crypto
                     WHERE baseCurrency IN ({})
                     group by ticker
                     having count(date) > 500 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
                     )
-                    SELECT date(p.date) Date, u.ticker Ticker, 'Crypto' as Universe,
+                    SELECT toString(date(p.date)) Date, u.ticker Ticker, 'Crypto' as Universe,
                     open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
                     FROM crypto p
                     INNER JOIN univ u
                     ON u.ticker = p.baseCurrency
                     WHERE date > '2020-01-01' AND NOT match(u.ticker, '\\d[ls]$')
-                    order by ticker, date", ticker_list)
+                    order by ticker, date",
+                    ticker_list
+                )
             } else {
-                // Non-production non-Crypto query
-                format!("WITH mdate AS (
+                format!(
+                    "WITH mdate AS (
                     SELECT symbol, max(date(date)) AS maxdate
                     FROM usd p
                     WHERE symbol IN ({})
                     group by symbol
                     having count(date) >= 250 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
                     )
-                    SELECT date(p.date) Date
+                    SELECT toString(date(p.date)) Date
                     , symbol AS Ticker
                     , '{univ}' AS Universe
                     , round(adjOpen, 2) AS Open
@@ -243,177 +173,123 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     ON m.symbol = p.symbol
                     WHERE p.date >= subtractDays(now(), 365)
                     and m.maxdate IN (select max(date(date)) from usd)
-                    order by Ticker, date", ticker_list)
+                    order by Ticker, date",
+                    ticker_list
+                )
             };
-            
-            let user = env::var("CLICKHOUSE_USER")?;
-            let pw = env::var("CLICKHOUSE_PASSWORD")?;
-            
-            let clickhouse_client_path = if cfg!(target_os = "macos") {
-                "/Users/rogerbos/ClickHouse/build/programs/clickhouse-client"
-            } else {
-                "/usr/local/bin/clickhouse-client"
-            };
-
-            let cmd = format!(
-                r#"{} --host='vdib5n7pan.europe-west4.gcp.clickhouse.cloud' --user='{}' --password='{}' --secure --database=tiingo -q "{}" --format=CSVWithNames > {}"#, 
-                clickhouse_client_path, user, pw, query, temp_filename.clone()
+            println!(
+                "Executing query for chunk {}/{} (attempt {})",
+                i + 1,
+                ticker_chunks.len(),
+                attempts
             );
 
-            // let cmd = format!(
-            //     r#"/usr/local/bin/clickhouse-client --host='vdib5n7pan.europe-west4.gcp.clickhouse.cloud' --user='{}' --password='{}' --secure --database=tiingo -q "{}" --format=CSVWithNames > {}"#, 
-            //     user, pw, query, temp_filename.clone()
-            // );
+            // Execute the query and write to the single CSV file
+            let mut cursor = client.query(&query).fetch::<OHLCV>()?;
+            let mut wrote_row = false;
 
-            // println!("Attempt {} for chunk {}", attempts, i);
-            
-            let output = Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&cmd)
-                .output()?;
+            while let Some(row) = cursor.next().await? {
+                wtr.serialize(row)?;
+                wrote_row = true;
+            }
 
-            if output.status.success() {
-                success = true;
-                println!("Successfully processed chunk {}", i);
+            if wrote_row {
+                chunk_success = true;
             } else {
-                // Check if the file was created and has content despite the error
-                if std::path::Path::new(&temp_filename).exists() {
-                    let metadata = std::fs::metadata(&temp_filename)?;
-                    if metadata.len() > 0 {
-                        // If we have data, consider it a success despite the error
-                        println!("Chunk {} produced data despite error, continuing", i);
-                        success = true;
-                        continue;
-                    }
-                }
-                
-                eprintln!(
-                    "Query failed (attempt {}/{}) with status: {:?}", 
-                    attempts, MAX_ATTEMPTS, output.status
-                );
-                eprintln!("stderr: {:?}", String::from_utf8_lossy(&output.stderr));
-                
-                if attempts < MAX_ATTEMPTS {
-                    println!("Retrying in 5 seconds...");
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                } else {
-                    eprintln!("All attempts failed for chunk {}", i);
-                }
+                println!("No rows returned for chunk {} on attempt {}", i, attempts);
+            }
+
+            if !chunk_success && attempts < MAX_ATTEMPTS {
+                println!("Retrying in 5 seconds...");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            } else if !chunk_success && attempts == MAX_ATTEMPTS {
+                eprintln!("All attempts failed for chunk {}", i);
             }
         }
-        
-        if !success {
-            // Create empty file to avoid processing errors, but log the failure
-            std::fs::write(&temp_filename, "Date,Ticker,Universe,Open,High,Low,Close,Volume\n")?;
-            eprintln!("Failed to process chunk {} after {} attempts", i, MAX_ATTEMPTS);
-        }
     }
-    
-    // Combine the temp files into the final file
-    println!("Combining {} temporary files", temp_files.len());
-    combine_csv_files(&temp_files, &filename)?;
-    
-    // Clean up temp files
-    for temp_file in temp_files {
-        std::fs::remove_file(temp_file)?;
-    }
-    
+    wtr.flush()?;
     println!("Successfully created {}", filename);
     Ok(())
 }
 
 // Function to get the list of tickers in a universe
-async fn get_universe_tickers(univ: &str) -> Result<Vec<String>, Box<dyn StdError>> {
-    let client = get_ch_cloud_client().await?;
-    
+async fn get_universe_tickers(
+    univ: &str,
+    _production: bool,
+) -> Result<Vec<String>, Box<dyn StdError>> {
+    let client = get_ch_client(ChConnectionType::Local).await?;
+
     let query = if univ == "Crypto" {
         "SELECT DISTINCT baseCurrency FROM crypto ORDER BY baseCurrency".to_string()
     } else {
-        format!("SELECT DISTINCT Ticker FROM univ WHERE batch = '{}' ORDER BY Ticker", univ)
+        format!(
+            "SELECT DISTINCT Ticker FROM univ WHERE batch = '{}' ORDER BY Ticker",
+            univ
+        )
     };
-    
-    let tickers: Vec<String> = client.query(&query).fetch_all().await?;
-    
-    Ok(tickers)
-}
 
-// Function to combine CSV files with headers
-fn combine_csv_files(temp_files: &[String], output_file: &str) -> Result<(), Box<dyn StdError>> {
-    if temp_files.is_empty() {
-        return Ok(());
-    }
-    
-    // Create the output file
-    let mut output = std::fs::File::create(output_file)?;
-    
-    // Process the first file - include headers
-    if let Ok(content) = std::fs::read_to_string(&temp_files[0]) {
-        std::io::Write::write_all(&mut output, content.as_bytes())?;
-    }
-    
-    // Process the remaining files - skip headers
-    for file in &temp_files[1..] {
-        if let Ok(content) = std::fs::read_to_string(file) {
-            // Skip the header line by finding the first newline
-            if let Some(pos) = content.find('\n') {
-                let without_header = &content[pos + 1..];
-                std::io::Write::write_all(&mut output, without_header.as_bytes())?;
-            }
-        }
-    }
-    
-    Ok(())
+    let tickers: Vec<String> = client.query(&query).fetch_all().await?;
+    Ok(tickers)
+    // let tickers = client
+    //     .query(&query)
+    //     .fetch_all::<TickerRow>()
+    //     .await?
+    //     .into_iter()
+    //     .map(|row| row.ticker)
+    //     .collect();
+
+    // Ok(tickers)
 }
 
 fn read_env_var(key: &str) -> String {
     env::var(key).unwrap_or_else(|_| panic!("{key} env variable should be set"))
 }
 
-pub async fn get_ch_cloud_client() -> Result<Client, Box<dyn StdError>> {
-    let client = Client::default()
-        .with_url("https://vdib5n7pan.europe-west4.gcp.clickhouse.cloud")
-        .with_user(read_env_var("CLICKHOUSE_USER"))
-        .with_password(read_env_var("CLICKHOUSE_PASSWORD"))
-        .with_database("tiingo");
-    let query_result = client.query("SELECT version()").fetch_one::<String>().await;
-
-    match query_result {
-        Ok(version) => {
-            println!("Successfully connected to ClickHouse. Server version: {}", version);
-            Ok(client)  // Connection is successful
+pub async fn get_ch_client(connection_type: ChConnectionType) -> Result<Client, Box<dyn StdError>> {
+    let (url, user, password, database, conn_type_str) = match connection_type {
+        ChConnectionType::Local => {
+            let host = "192.168.86.46";
+            (
+                format!("http://{}:8123", host),
+                "roger".to_string(),
+                read_env_var("PG"),
+                "tiingo".to_string(),
+                "Local",
+            )
         }
-        Err(e) => {
-            println!("Failed to connect to ClickHouse: {:?}", e);
-            Err(Box::new(e))  // Propagate the error
+        ChConnectionType::Remote => {
+            let host = "192.168.86.56";
+            (
+                format!("http://{}:8123", host),
+                "roger".to_string(),
+                read_env_var("PG"),
+                "tiingo".to_string(),
+                "Remote",
+            )
         }
-    }    
-}
-
-pub async fn get_ch_client(remote: bool) -> Result<Client, Box<dyn StdError>> {
-
-    let host = if remote {
-        read_env_var("CLICKHOUSE_HOSTR")
-    } else {
-        read_env_var("CLICKHOUSE_HOSTL")
     };
-    let url = format!("http://{}:8123", host);
+
     let client = Client::default()
         .with_url(url)
-        .with_user("roger")
-        .with_password(read_env_var("PG"))
-        .with_database("tiingo");
+        .with_user(user)
+        .with_password(password)
+        .with_database(database);
+
     let query_result = client.query("SELECT version()").fetch_one::<String>().await;
 
     match query_result {
         Ok(version) => {
-            println!("Successfully connected to ClickHouse Remote. Server version: {}", version);
+            println!(
+                "Successfully connected to ClickHouse {}. Server version: {}",
+                conn_type_str, version
+            );
             Ok(client)
         }
         Err(e) => {
-            println!("Failed to connect to ClickHouse Remote: {:?}", e);
+            println!("Failed to connect to ClickHouse {}: {:?}", conn_type_str, e);
             Err(Box::new(e))
         }
-    }    
+    }
 }
 
 #[derive(Clone, Debug, Row, Serialize)]
@@ -421,80 +297,128 @@ struct Score {
     date: String,
     universe: String,
     ticker: String,
-    // strategy: String,
     side: i64,
     risk_reward: f64,
     expectancy: f64,
     profit_factor: f64,
     pos_conf: f64,
-    neg_conf: f64
+    neg_conf: f64,
 }
 
-
 pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdError>> {
+    // Create both clients
+    let client_local = get_ch_client(ChConnectionType::Local).await?;
+    let client_remote = get_ch_client(ChConnectionType::Remote).await?;
 
-    let client = get_ch_client(false).await?;
-    let client_remote = get_ch_client(true).await?;
-
+    // Extract column data once
     let date_column = df.column("date")?.date()?;
     let universe_column = df.column("universe")?.str()?;
     let ticker_column = df.column("ticker")?.str()?;
-    // let strategy_column = df.column("strategy")?.str()?;
     let side_column = df.column("side")?.i64()?;
     let risk_reward_column = df.column("risk_reward")?.f64()?;
     let expectancy_column = df.column("expectancy")?.f64()?;
     let profit_factor_column = df.column("profit_factor")?.f64()?;
     let pos_conf_column = df.column("pos_conf")?.f64()?;
     let neg_conf_column = df.column("neg_conf")?.f64()?;
-    
-    let mut insert = client.insert("lppl_score")?;
-    for i in 0..df.height() {
-        let date_days = date_column.get(i).unwrap();
-        let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1)
-            .expect("Invalid base date")
-            + Duration::days(date_days as i64);
-        let date_str = naive_date.to_string();
-        let row = Score {
-            date: date_str,
-            universe: universe_column.get(i).unwrap().to_string(),
-            ticker: ticker_column.get(i).unwrap().to_string(),
-            // strategy: strategy_column.get(i).unwrap().to_string(),
-            side: side_column.get(i).unwrap(),
-            risk_reward: risk_reward_column.get(i).unwrap(),
-            expectancy: expectancy_column.get(i).unwrap(),
-            profit_factor: profit_factor_column.get(i).unwrap(),
-            pos_conf: pos_conf_column.get(i).unwrap(),
-            neg_conf: neg_conf_column.get(i).unwrap(),
-        };
-        // println!("row: {:?}", row.clone());
-        insert.write(&row).await?;
-    }
-    insert.end().await?;
 
-   let mut insert = client_remote.insert("lppl_score")?;
-    for i in 0..df.height() {
-        let date_days = date_column.get(i).unwrap();
-        let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1)
-            .expect("Invalid base date")
-            + Duration::days(date_days as i64);
-        let date_str = naive_date.to_string();
-        let row = Score {
-            date: date_str,
-            universe: universe_column.get(i).unwrap().to_string(),
-            ticker: ticker_column.get(i).unwrap().to_string(),
-            // strategy: strategy_column.get(i).unwrap().to_string(),
-            side: side_column.get(i).unwrap(),
-            risk_reward: risk_reward_column.get(i).unwrap(),
-            expectancy: expectancy_column.get(i).unwrap(),
-            profit_factor: profit_factor_column.get(i).unwrap(),
-            pos_conf: pos_conf_column.get(i).unwrap(),
-            neg_conf: neg_conf_column.get(i).unwrap(),
-        };
-        // println!("row: {:?}", row.clone());
-        insert.write(&row).await?;
+    // Create a vector of (client, name, use_binary) tuples to process
+    let clients = vec![
+        (client_local, "local", true),
+        (client_remote, "remote", false),  // Use SQL INSERT for remote due to version incompatibility
+    ];
+
+    for (client, location, use_binary) in clients {
+        let result = async {
+            if use_binary {
+                // Use binary format for local (faster)
+                let batch_size = 1000;
+                for batch_start in (0..df.height()).step_by(batch_size) {
+                    let batch_end = (batch_start + batch_size).min(df.height());
+                    let mut insert = client.insert("lppl_score")?;
+
+                    for i in batch_start..batch_end {
+                        let date_days = date_column.get(i).unwrap();
+                        let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("Invalid base date")
+                            + Duration::days(date_days as i64);
+                        let date_str = naive_date.to_string();
+
+                        let row = Score {
+                            date: date_str,
+                            universe: universe_column.get(i).unwrap().to_string(),
+                            ticker: ticker_column.get(i).unwrap().to_string(),
+                            side: side_column.get(i).unwrap(),
+                            risk_reward: risk_reward_column.get(i).unwrap(),
+                            expectancy: expectancy_column.get(i).unwrap(),
+                            profit_factor: profit_factor_column.get(i).unwrap(),
+                            pos_conf: pos_conf_column.get(i).unwrap(),
+                            neg_conf: neg_conf_column.get(i).unwrap(),
+                        };
+                        insert.write(&row).await?;
+                    }
+                    insert.end().await?;
+                }
+            } else {
+                // Use SQL VALUES format for remote (more compatible across versions)
+                let batch_size = 50;
+                for batch_start in (0..df.height()).step_by(batch_size) {
+                    let batch_end = (batch_start + batch_size).min(df.height());
+                    
+                    let mut values = Vec::new();
+                    for i in batch_start..batch_end {
+                        let date_days = date_column.get(i).unwrap();
+                        let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("Invalid base date")
+                            + Duration::days(date_days as i64);
+                        let date_str = naive_date.to_string();
+                        
+                        let universe = universe_column.get(i).unwrap();
+                        let ticker = ticker_column.get(i).unwrap().replace("'", "''"); // Escape single quotes
+                        let side = side_column.get(i).unwrap();
+                        let risk_reward = risk_reward_column.get(i).unwrap();
+                        let expectancy = expectancy_column.get(i).unwrap();
+                        let profit_factor = profit_factor_column.get(i).unwrap();
+                        let pos_conf = pos_conf_column.get(i).unwrap();
+                        let neg_conf = neg_conf_column.get(i).unwrap();
+                        
+                        values.push(format!(
+                            "('{}', '{}', '{}', {}, {}, {}, {}, {}, {})",
+                            date_str, universe, ticker, side, risk_reward, expectancy,
+                            profit_factor, pos_conf, neg_conf
+                        ));
+                    }
+                    
+                    let query = format!(
+                        "INSERT INTO lppl_score (date, universe, ticker, side, risk_reward, expectancy, \
+                         profit_factor, pos_conf, neg_conf) VALUES {}",
+                        values.join(", ")
+                    );
+                    
+                    client.query(&query).execute().await?;
+                    
+                    // Progress indicator
+                    if batch_end % 100 == 0 || batch_end == df.height() {
+                        println!("Progress {}: {}/{} rows", location, batch_end, df.height());
+                    }
+                    
+                    // Small delay between batches
+                    time::sleep(time::Duration::from_millis(100)).await;
+                }
+            }
+            Ok::<(), Box<dyn StdError>>(())
+        }
+        .await;
+        
+        match result {
+            Ok(_) => println!(
+                "Successfully inserted {} rows into ClickHouse {}",
+                df.height(), location
+            ),
+            Err(e) => eprintln!(
+                "Failed to insert rows into ClickHouse {}: {:?}",
+                location, e
+            ),
+        }
     }
-    insert.end().await?;
- 
+
     Ok(())
 }
 
