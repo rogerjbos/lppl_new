@@ -5,3 +5,9 @@
 /output_crypto
 /performance
 /score
+# Additional data file patterns to ensure they're ignored
+*.parquet
+*.csv
+!test.csv
+
+.env

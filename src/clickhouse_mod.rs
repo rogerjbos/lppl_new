@@ -93,87 +93,178 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
             attempts += 1;
 
             let query = if production && univ == "Crypto" {
-                format!("WITH univ AS (
-                    SELECT baseCurrency ticker, max(date) maxdate
-                    FROM crypto
+                format!("WITH primary_quotes AS (
+                    -- Step 1: Find the quote currency with the max volume for each (baseCurrency, date)
+                    SELECT
+                        baseCurrency,
+                        date,
+                        quoteCurrency,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume,
+                        volumeNotional,
+                        tradesDone,
+                        ticker
+                    FROM (
+                        SELECT
+                            baseCurrency,
+                            date,
+                            quoteCurrency,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            volumeNotional,
+                            tradesDone,
+                            ticker,
+                            row_number() OVER (PARTITION BY baseCurrency, date ORDER BY volume DESC) as volume_rank
+                        FROM crypto
+                    ) WHERE volume_rank = 1
+                ),
+                univ AS (
+                    -- Step 2: Your original universe selection logic, now applied to the de-duplicated data
+                    SELECT
+                        baseCurrency ticker,
+                        max(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d')) maxdate
+                    FROM primary_quotes -- Use the de-duplicated data here
                     WHERE baseCurrency IN ({})
-                    group by ticker
-                    having count(date) > 130 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
-                    )
-                    SELECT toString(date(p.date)) Date, u.ticker Ticker, 'Crypto' as Universe,
-                    open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
-                    FROM crypto p
-                    INNER JOIN univ u
-                    ON u.ticker = p.baseCurrency
-                    WHERE p.date >= subtractDays(now(), 250)
-                    and maxdate IN (select max(date) from crypto) AND NOT match(u.ticker, '\\d[ls]$')
-                    order by ticker, date", ticker_list)
+                    GROUP BY ticker
+                    HAVING count(date) > 500 AND COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
+                )
+                -- Step 3: Final selection, also joining against the de-duplicated data
+                SELECT
+                    formatDateTime(toTimeZone(pq.date, 'UTC'), '%Y-%m-%d') Date,
+                    u.ticker Ticker,
+                    'Crypto' as Universe,
+                    pq.open AS Open,
+                    pq.high AS High,
+                    pq.low AS Low,
+                    pq.close AS Close,
+                    pq.volume AS Volume
+                FROM primary_quotes pq -- Use the de-duplicated data here
+                INNER JOIN univ u ON u.ticker = pq.baseCurrency
+                WHERE pq.date > '2020-01-01' AND NOT match(u.ticker, '\\d[ls]$')
+                ORDER BY Ticker, Date", ticker_list)
             } else if production && univ != "Crypto" {
                 format!(
-                    "WITH mdate AS (
-                    SELECT symbol, max(date(date)) AS maxdate
-                    FROM usd p
-                    WHERE symbol IN ({})
-                    group by symbol
-                    having count(date) >= 130 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
+                    "WITH 
+                    max_usd_date AS (
+                        SELECT max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS max_date
+                        FROM usd
+                    ),
+                    mdate AS (
+                        SELECT symbol, max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS maxdate
+                        FROM usd p
+                        WHERE symbol IN ({})
+                        group by symbol
+                        having count(date) >= 130 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
                     )
-                    SELECT toString(date(p.date)) Date
-                    , symbol AS Ticker
+                    SELECT toString(date(formatDateTime(toTimeZone(p.date, 'UTC'), '%Y-%m-%d'))) Date
+                    , p.symbol AS Ticker
                     , '{univ}' AS Universe
                     , round(adjOpen, 2) AS Open
                     , round(adjHigh, 2) AS High
                     , round(adjLow, 2) AS Low
                     , round(adjClose, 2) AS Close
                     , round(adjVolume, 2) AS Volume
-                    FROM usd p
-                    INNER JOIN mdate m
-                    ON m.symbol = p.symbol
+                    FROM usd p FINAL
+                    INNER JOIN mdate m ON m.symbol = p.symbol
+                    CROSS JOIN max_usd_date mu
                     WHERE p.date >= subtractDays(now(), 365)
-                    and m.maxdate IN (select max(date(date)) from usd)
-                    order by Ticker, date",
+                    AND m.maxdate = mu.max_date
+                    order by Ticker, Date",
                     ticker_list
                 )
             } else if !production && univ == "Crypto" {
                 format!(
-                    "WITH univ AS (
-                    SELECT baseCurrency ticker, max(date) maxdate
-                    FROM crypto
+                    "WITH primary_quotes AS (
+                    -- Step 1: Find the quote currency with the max volume for each (baseCurrency, date)
+                    SELECT
+                        baseCurrency,
+                        date,
+                        quoteCurrency,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume,
+                        volumeNotional,
+                        tradesDone,
+                        ticker
+                    FROM (
+                        SELECT
+                            baseCurrency,
+                            date,
+                            quoteCurrency,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            volumeNotional,
+                            tradesDone,
+                            ticker,
+                            row_number() OVER (PARTITION BY baseCurrency, date ORDER BY volume DESC) as volume_rank
+                        FROM crypto
+                    ) WHERE volume_rank = 1
+                ),
+                univ AS (
+                    -- Step 2: Your original universe selection logic, now applied to the de-duplicated data
+                    SELECT
+                        baseCurrency ticker,
+                        max(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d %H:%i:%s')) maxdate
+                    FROM primary_quotes
                     WHERE baseCurrency IN ({})
-                    group by ticker
-                    having count(date) > 500 and COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
-                    )
-                    SELECT toString(date(p.date)) Date, u.ticker Ticker, 'Crypto' as Universe,
-                    open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
-                    FROM crypto p
-                    INNER JOIN univ u
-                    ON u.ticker = p.baseCurrency
-                    WHERE date > '2020-01-01' AND NOT match(u.ticker, '\\d[ls]$')
-                    order by ticker, date",
+                    GROUP BY ticker
+                    HAVING count(date) > 500 AND COUNT(*) * 2 - COUNT(high) - COUNT(low) = 0
+                )
+                -- Step 3: Final selection, also joining against the de-duplicated data
+                SELECT
+                    formatDateTime(toTimeZone(pq.date, 'UTC'), '%Y-%m-%d %H:%i:%s') Date,
+                    u.ticker Ticker,
+                    'Crypto' as Universe,
+                    pq.open AS Open,
+                    pq.high AS High,
+                    pq.low AS Low,
+                    pq.close AS Close,
+                    pq.volume AS Volume
+                FROM primary_quotes pq -- Use the de-duplicated data here
+                INNER JOIN univ u ON u.ticker = pq.baseCurrency
+                WHERE pq.date > '2020-01-01' AND NOT match(u.ticker, '\\d[ls]$')
+                ORDER BY Ticker, Date",
                     ticker_list
                 )
             } else {
                 format!(
-                    "WITH mdate AS (
-                    SELECT symbol, max(date(date)) AS maxdate
-                    FROM usd p
-                    WHERE symbol IN ({})
-                    group by symbol
-                    having count(date) >= 250 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
+                    "WITH 
+                    max_usd_date AS (
+                        SELECT max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS max_date
+                        FROM usd
+                    ),
+                    mdate AS (
+                        SELECT symbol, max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS maxdate
+                        FROM usd p
+                        WHERE symbol IN ({})
+                        group by symbol
+                        having count(date) >= 250 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
                     )
-                    SELECT toString(date(p.date)) Date
-                    , symbol AS Ticker
+                    SELECT toString(date(formatDateTime(toTimeZone(p.date, 'UTC'), '%Y-%m-%d'))) Date
+                    , p.symbol AS Ticker
                     , '{univ}' AS Universe
                     , round(adjOpen, 2) AS Open
                     , round(adjHigh, 2) AS High
                     , round(adjLow, 2) AS Low
                     , round(adjClose, 2) AS Close
                     , round(adjVolume, 2) AS Volume
-                    FROM usd p
-                    INNER JOIN mdate m
-                    ON m.symbol = p.symbol
+                    FROM usd p FINAL
+                    INNER JOIN mdate m ON m.symbol = p.symbol
+                    CROSS JOIN max_usd_date mu
                     WHERE p.date >= subtractDays(now(), 365)
-                    and m.maxdate IN (select max(date(date)) from usd)
-                    order by Ticker, date",
+                    AND m.maxdate = mu.max_date
+                    order by Ticker, Date",
                     ticker_list
                 )
             };
@@ -230,15 +321,6 @@ async fn get_universe_tickers(
 
     let tickers: Vec<String> = client.query(&query).fetch_all().await?;
     Ok(tickers)
-    // let tickers = client
-    //     .query(&query)
-    //     .fetch_all::<TickerRow>()
-    //     .await?
-    //     .into_iter()
-    //     .map(|row| row.ticker)
-    //     .collect();
-
-    // Ok(tickers)
 }
 
 fn read_env_var(key: &str) -> String {
@@ -324,7 +406,7 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
     // Create a vector of (client, name, use_binary) tuples to process
     let clients = vec![
         (client_local, "local", true),
-        (client_remote, "remote", false),  // Use SQL INSERT for remote due to version incompatibility
+        (client_remote, "remote", false), // Use SQL INSERT for remote due to version incompatibility
     ];
 
     for (client, location, use_binary) in clients {
@@ -355,21 +437,20 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
                         };
                         insert.write(&row).await?;
                     }
-                    insert.end().await?;
                 }
             } else {
                 // Use SQL VALUES format for remote (more compatible across versions)
                 let batch_size = 50;
                 for batch_start in (0..df.height()).step_by(batch_size) {
                     let batch_end = (batch_start + batch_size).min(df.height());
-                    
+
                     let mut values = Vec::new();
                     for i in batch_start..batch_end {
                         let date_days = date_column.get(i).unwrap();
                         let naive_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("Invalid base date")
                             + Duration::days(date_days as i64);
                         let date_str = naive_date.to_string();
-                        
+
                         let universe = universe_column.get(i).unwrap();
                         let ticker = ticker_column.get(i).unwrap().replace("'", "''"); // Escape single quotes
                         let side = side_column.get(i).unwrap();
@@ -378,27 +459,27 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
                         let profit_factor = profit_factor_column.get(i).unwrap();
                         let pos_conf = pos_conf_column.get(i).unwrap();
                         let neg_conf = neg_conf_column.get(i).unwrap();
-                        
+
                         values.push(format!(
                             "('{}', '{}', '{}', {}, {}, {}, {}, {}, {})",
                             date_str, universe, ticker, side, risk_reward, expectancy,
                             profit_factor, pos_conf, neg_conf
                         ));
                     }
-                    
+
                     let query = format!(
                         "INSERT INTO lppl_score (date, universe, ticker, side, risk_reward, expectancy, \
                          profit_factor, pos_conf, neg_conf) VALUES {}",
                         values.join(", ")
                     );
-                    
+
                     client.query(&query).execute().await?;
-                    
+
                     // Progress indicator
                     if batch_end % 100 == 0 || batch_end == df.height() {
                         println!("Progress {}: {}/{} rows", location, batch_end, df.height());
                     }
-                    
+
                     // Small delay between batches
                     time::sleep(time::Duration::from_millis(100)).await;
                 }
@@ -406,11 +487,12 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
             Ok::<(), Box<dyn StdError>>(())
         }
         .await;
-        
+
         match result {
             Ok(_) => println!(
                 "Successfully inserted {} rows into ClickHouse {}",
-                df.height(), location
+                df.height(),
+                location
             ),
             Err(e) => eprintln!(
                 "Failed to insert rows into ClickHouse {}: {:?}",
@@ -421,23 +503,3 @@ pub async fn insert_score_dataframe(df: DataFrame) -> Result<(), Box<dyn StdErro
 
     Ok(())
 }
-
-// pub async fn create_score_table() -> Result<(), Box<dyn StdError>> {
-
-//     let client = get_ch_client().await?;
-//     let txt: &str = "CREATE OR REPLACE TABLE tiingo.lppl_score (
-//         date String,
-//         universe LowCardinality(String),
-//         ticker LowCardinality(String),
-//         side Int64,
-//         risk_reward Float64,
-//         expectancy Float64,
-//         profit_factor Float64,
-//         pos_conf Float64,
-//         neg_conf Float64 )
-//     ENGINE = ReplacingMergeTree
-//     ORDER BY ticker";
-//     let _ = client.query(&txt).execute().await;
-
-//     Ok(())
-// }
