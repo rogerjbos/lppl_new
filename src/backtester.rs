@@ -1,12 +1,17 @@
 use polars::prelude::*;
 use serde::Serialize;
 use std::{
-    cmp, collections::HashSet, env, error::Error as StdError, fmt, fmt::Debug, fs::File,
-    io::Cursor, path::Path, result::Result, sync::Arc,
+    collections::HashSet, env, error::Error as StdError, fmt, fmt::Debug, fs::File, io::Cursor,
+    path::Path, result::Result, sync::Arc,
 };
 use tokio::{fs, task::JoinError};
 
 use crate::clickhouse_mod::write_price_file;
+
+/// Maximum holding period for a backtest position, in bars (~6 trading
+/// months). A position not closed by an opposite signal exits at the open
+/// this many bars after entry.
+pub const MAX_HOLD_BARS: usize = 126;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Backtest {
@@ -594,50 +599,72 @@ pub fn backtest_performance(
 ) -> Result<Backtest, Box<dyn StdError>> {
     let len = df.height();
 
-    let mut long_result = vec![0.0; len];
-    let mut short_result = vec![0.0; len];
-
     let open = df.column("Open").unwrap().f64().unwrap();
+    let close = df.column("Close").unwrap().f64().unwrap();
 
-    // Variable holding period
+    // Position-based trade simulation with percent returns (comparable
+    // across tickers regardless of price level).
+    // - A buy signal opens a long, a sell signal opens a short.
+    // - Repeated same-direction signals while a position is open are
+    //   ignored (no chaining into 1-bar trades).
+    // - An opposite signal closes the position at that bar's open and
+    //   reverses into the new direction.
+    // - A position is closed after MAX_HOLD_BARS bars, and any position
+    //   still open at the end of the data is marked to market at the
+    //   final close.
+    // - The final bar's signal is derived from same-day confidence (kept
+    //   for the production buy/sell list), so the backtest ignores it.
+    let mut trade_results: Vec<f64> = Vec::new();
+    let mut position: i32 = 0; // 0 = flat, 1 = long, -1 = short
+    let mut entry_price = f64::NAN;
+    let mut entry_bar: usize = 0;
+
     for i in 0..len {
-        if side.buy[i] == 1 {
-            for a in i + 1..cmp::min(i + 1000, len) {
-                if side.buy[a] == 1 || side.sell[a] == -1 {
-                    long_result[a] = open.get(a).unwrap() - open.get(i).unwrap();
-                    break;
+        let is_last = i == len - 1;
+        let buy_sig = !is_last && side.buy[i] == 1;
+        let sell_sig = !is_last && side.sell[i] == -1;
+
+        if position != 0 {
+            let opposite = (position == 1 && sell_sig) || (position == -1 && buy_sig);
+            let expired = i - entry_bar >= MAX_HOLD_BARS;
+            if opposite || expired || is_last {
+                let exit_price = if is_last {
+                    close.get(i).unwrap_or(f64::NAN)
+                } else {
+                    open.get(i).unwrap_or(f64::NAN)
+                };
+                if entry_price > 0.0 && exit_price.is_finite() {
+                    let ret = if position == 1 {
+                        (exit_price / entry_price - 1.0) * 100.0
+                    } else {
+                        (entry_price - exit_price) / entry_price * 100.0
+                    };
+                    trade_results.push(ret);
                 }
+                position = 0;
+                entry_price = f64::NAN;
+            }
+        }
+
+        if position == 0 && (buy_sig || sell_sig) {
+            let price = open.get(i).unwrap_or(f64::NAN);
+            if price > 0.0 {
+                position = if buy_sig { 1 } else { -1 };
+                entry_price = price;
+                entry_bar = i;
             }
         }
     }
-    for i in 0..len {
-        if side.sell[i] == -1 {
-            for a in i + 1..cmp::min(i + 1000, len) {
-                if side.buy[a] == 1 || side.sell[a] == -1 {
-                    short_result[a] = open.get(i).unwrap() - open.get(a).unwrap();
-                    break;
-                }
-            }
-        }
-    }
-
-    // Aggregating the long & short results into one column
-    let total_result: Vec<f64> = long_result
-        .iter()
-        .zip(short_result.iter())
-        .map(|(&l, &s)| l + s)
-        .collect();
-    // println!("total_result: {:?}", total_result);
 
     // Profit factor
-    let total_net_profits: Vec<f64> = total_result
-        .clone()
-        .into_iter()
+    let total_net_profits: Vec<f64> = trade_results
+        .iter()
+        .copied()
         .filter(|&x| x > 0.0)
         .collect();
-    let total_net_losses: Vec<f64> = total_result
-        .clone()
-        .into_iter()
+    let total_net_losses: Vec<f64> = trade_results
+        .iter()
+        .copied()
         .filter(|&x| x < 0.0)
         .collect();
     let sum_total_net_profits = total_net_profits.iter().sum::<f64>();
@@ -688,12 +715,7 @@ pub fn backtest_performance(
             f64::min(100., rr)
         }
     };
-    let trades: i32 = total_result
-        .clone()
-        .into_iter()
-        .filter(|&x| x != 0.0)
-        .collect::<Vec<_>>()
-        .len() as i32;
+    let trades: i32 = trade_results.len() as i32;
 
     // Expectancy
     let expectancy = {
@@ -795,6 +817,110 @@ pub fn showbt(bt: Backtest) -> Result<(), Box<dyn StdError>> {
     println!("Pos Conf:         {:.1}", bt.pos_conf);
     println!("Neg Conf:         {:.1}", bt.neg_conf);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backtest_performance_percent_returns() {
+        let df = polars::df!(
+            "Date" => &["d1", "d2", "d3", "d4", "d5", "d6"],
+            "Ticker" => &["TST"; 6],
+            "Universe" => &["U"; 6],
+            "Open" => &[100.0, 100.0, 110.0, 120.0, 115.0, 95.0],
+            "Close" => &[100.0, 105.0, 115.0, 118.0, 110.0, 90.0],
+        )
+        .unwrap();
+
+        // Long entered at bar 1 reverses into a short at the sell signal
+        // (bar 3); the short is still open at the end and is marked to
+        // market at the final close. The final bar's sell signal is
+        // ignored by the backtest (same-day confidence).
+        let side = BuySell {
+            buy: vec![0, 1, 0, 0, 0, 0],
+            sell: vec![0, 0, 0, -1, 0, -1],
+            pos_conf: vec![0.0; 6],
+            neg_conf: vec![0.0; 6],
+        };
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+
+        // long: 100 -> 120 = +20%, short: 120 -> 90 (last close) = +25%
+        assert_eq!(bt.trades, 2);
+        assert!((bt.avg_gain - 22.5).abs() < 1e-9, "avg_gain: {}", bt.avg_gain);
+        assert!((bt.max_gain - 25.0).abs() < 1e-9, "max_gain: {}", bt.max_gain);
+        assert!((bt.hit_ratio - 100.0).abs() < 1e-9);
+        assert_eq!(bt.buys, 1);
+        assert_eq!(bt.sells, 2);
+    }
+
+    #[test]
+    fn test_repeated_buy_signals_do_not_chain() {
+        let df = polars::df!(
+            "Date" => &["d1", "d2", "d3", "d4", "d5", "d6"],
+            "Ticker" => &["TST"; 6],
+            "Universe" => &["U"; 6],
+            "Open" => &[100.0, 100.0, 105.0, 110.0, 120.0, 125.0],
+            "Close" => &[100.0, 102.0, 107.0, 112.0, 122.0, 130.0],
+        )
+        .unwrap();
+
+        // Consecutive buy signals used to chain into 1-bar trades; now
+        // they hold a single long, marked to market at the final close.
+        let side = BuySell {
+            buy: vec![0, 1, 1, 1, 0, 0],
+            sell: vec![0, 0, 0, 0, 0, 0],
+            pos_conf: vec![0.0; 6],
+            neg_conf: vec![0.0; 6],
+        };
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+
+        // one long: 100 -> 130 (last close) = +30%
+        assert_eq!(bt.trades, 1);
+        assert!((bt.max_gain - 30.0).abs() < 1e-9, "max_gain: {}", bt.max_gain);
+    }
+
+    #[test]
+    fn test_max_holding_period_exit() {
+        let n = MAX_HOLD_BARS + 10;
+        let dates: Vec<String> = (0..n).map(|i| format!("d{}", i)).collect();
+        let opens: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
+        let closes = opens.clone();
+        let mut buy = vec![0; n];
+        buy[1] = 1;
+
+        let df = polars::df!(
+            "Date" => dates,
+            "Ticker" => vec!["TST"; n],
+            "Universe" => vec!["U"; n],
+            "Open" => opens,
+            "Close" => closes,
+        )
+        .unwrap();
+
+        let side = BuySell {
+            buy,
+            sell: vec![0; n],
+            pos_conf: vec![0.0; n],
+            neg_conf: vec![0.0; n],
+        };
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+
+        // Entered at open[1] = 101, expired MAX_HOLD_BARS later at
+        // open[1 + MAX_HOLD_BARS] = 101 + 126 = 227.
+        let expected = (227.0 / 101.0 - 1.0) * 100.0;
+        assert_eq!(bt.trades, 1);
+        assert!(
+            (bt.max_gain - expected).abs() < 1e-9,
+            "max_gain: {} expected: {}",
+            bt.max_gain,
+            expected
+        );
+    }
 }
 
 pub async fn parquet_save_backtest(

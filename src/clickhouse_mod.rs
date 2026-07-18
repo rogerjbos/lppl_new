@@ -128,7 +128,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     -- Step 2: Your original universe selection logic, now applied to the de-duplicated data
                     SELECT
                         baseCurrency ticker,
-                        max(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d')) maxdate
+                        max(formatDateTime(date, '%Y-%m-%d')) maxdate
                     FROM primary_quotes -- Use the de-duplicated data here
                     WHERE baseCurrency IN ({})
                     GROUP BY ticker
@@ -136,7 +136,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                 )
                 -- Step 3: Final selection, also joining against the de-duplicated data
                 SELECT
-                    formatDateTime(toTimeZone(pq.date, 'UTC'), '%Y-%m-%d') Date,
+                    formatDateTime(date, '%Y-%m-%d') Date,
                     u.ticker Ticker,
                     'Crypto' as Universe,
                     pq.open AS Open,
@@ -150,19 +150,19 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                 ORDER BY Ticker, Date", ticker_list)
             } else if production && univ != "Crypto" {
                 format!(
-                    "WITH 
+                    "WITH
                     max_usd_date AS (
-                        SELECT max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS max_date
+                        SELECT max(date(formatDateTime(date, '%Y-%m-%d'))) AS max_date
                         FROM usd
                     ),
                     mdate AS (
-                        SELECT symbol, max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS maxdate
+                        SELECT symbol, max(date) AS maxdate
                         FROM usd p
                         WHERE symbol IN ({})
                         group by symbol
                         having count(date) >= 130 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
                     )
-                    SELECT toString(date(formatDateTime(toTimeZone(p.date, 'UTC'), '%Y-%m-%d'))) Date
+                    SELECT toString(date) Date
                     , p.symbol AS Ticker
                     , '{univ}' AS Universe
                     , round(adjOpen, 2) AS Open
@@ -223,7 +223,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                 )
                 -- Step 3: Final selection, also joining against the de-duplicated data
                 SELECT
-                    formatDateTime(toTimeZone(pq.date, 'UTC'), '%Y-%m-%d %H:%i:%s') Date,
+                    formatDateTime(pq.date, '%Y-%m-%d %H:%i:%s') Date,
                     u.ticker Ticker,
                     'Crypto' as Universe,
                     pq.open AS Open,
@@ -239,19 +239,19 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                 )
             } else {
                 format!(
-                    "WITH 
+                    "WITH
                     max_usd_date AS (
-                        SELECT max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS max_date
+                        SELECT max(date(formatDateTime(date, '%Y-%m-%d'))) AS max_date
                         FROM usd
                     ),
                     mdate AS (
-                        SELECT symbol, max(date(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d'))) AS maxdate
+                        SELECT symbol, max(date(formatDateTime(date, '%Y-%m-%d'))) AS maxdate
                         FROM usd p
                         WHERE symbol IN ({})
                         group by symbol
                         having count(date) >= 250 and COUNT(*) * 2 - COUNT(adjHigh) - COUNT(adjLow) = 0
                     )
-                    SELECT toString(date(formatDateTime(toTimeZone(p.date, 'UTC'), '%Y-%m-%d'))) Date
+                    SELECT toString(date(formatDateTime(p.date, '%Y-%m-%d'))) Date
                     , p.symbol AS Ticker
                     , '{univ}' AS Universe
                     , round(adjOpen, 2) AS Open

@@ -147,12 +147,9 @@ pub fn compute_nested_fits(
             let nested_t2 = *time_shrinking_slice.last().unwrap();
 
             // Use a match or Result to handle potential errors
-            if let Ok(result) = panic::catch_unwind(|| {
-                fit_argmin(
-                    time_shrinking_slice.to_vec(),
-                    price_shrinking_slice.to_vec(),
-                )
-            }) {
+            if let Ok(result) =
+                panic::catch_unwind(|| fit_argmin(time_shrinking_slice, price_shrinking_slice))
+            {
                 if let Ok((tc, m, w, a, b, c1, c2, best_cost)) = result {
                     let c = get_c(c1, c2);
                     let O = get_oscillations(w, tc, nested_t1, nested_t2);
@@ -185,7 +182,7 @@ pub fn compute_nested_fits(
                 }
             } else {
                 println!("Panic occurred at i: {} j: {}, skipping...", i, j);
-                break;
+                continue;
             }
         }
     }
@@ -264,17 +261,17 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
             .alias("is_qualified"),
         ])
         .with_columns(&[
-            col("b").lt_eq(lit(0.0)).alias("pos_count"),
+            col("b").lt(lit(0.0)).alias("pos_count"),
             // pos_qual_count column
             col("b")
-                .lt_eq(lit(0.0))
+                .lt(lit(0.0))
                 .and(col("is_qualified"))
                 .alias("pos_qual_count"),
             // neg_count column
-            col("b").gt_eq(lit(0.0)).alias("neg_count"),
+            col("b").gt(lit(0.0)).alias("neg_count"),
             // neg_qual_count column
             col("b")
-                .gt_eq(lit(0.0))
+                .gt(lit(0.0))
                 .and(col("is_qualified"))
                 .alias("neg_qual_count"),
         ])
@@ -287,14 +284,14 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
             col("p2").max().alias("price"),
         ])
         .with_columns(&[
-            when(col("pos_count_sum").gt_eq(lit(0.0)))
+            when(col("pos_count_sum").gt(lit(0)))
                 .then(
                     col("pos_qual_count_sum").cast(DataType::Float64)
                         / col("pos_count_sum").cast(DataType::Float64),
                 )
                 .otherwise(lit(0.0))
                 .alias("pos_conf"),
-            when(col("neg_count_sum").gt_eq(lit(0.0)))
+            when(col("neg_count_sum").gt(lit(0)))
                 .then(
                     col("neg_qual_count_sum").cast(DataType::Float64)
                         / col("neg_count_sum").cast(DataType::Float64),
@@ -925,6 +922,9 @@ pub async fn read_price_file(file_path: String) -> Result<LazyFrame, Box<dyn Std
         .with_schema(Some(schema))
         .with_has_header(true)
         .finish()?
+        // Drop rows where ln() would be undefined and that would otherwise
+        // poison the min-max scaling below.
+        .filter(col("Close").is_not_null().and(col("Close").gt(lit(0.0))))
         .with_column(
             col("Date")
                 .map(
@@ -944,26 +944,19 @@ pub async fn read_price_file(file_path: String) -> Result<LazyFrame, Box<dyn Std
                 .alias("time"),
         )
         .with_column(
-            // Get the minimum price and conditionally apply ln() based on its value
+            // LPPLS is defined on log price, so always take ln(). Negative
+            // log prices (sub-$1 assets) are perfectly valid; rows with
+            // null or non-positive Close are filtered out above.
             col("Close")
                 .map(
                     |s| {
-                        let chunked = s.f64().expect("series must contain f64 data");
-                        let min_price = chunked.min().unwrap_or(0.0);
-
-                        let transformed = if min_price > 1.0 {
-                            Box::new(
-                                chunked
-                                    .into_iter()
-                                    .map(|opt_price| opt_price.map(|price| price.ln())),
-                            ) as Box<dyn Iterator<Item = Option<f64>>>
-                        } else {
-                            Box::new(chunked.into_iter().map(|opt_price| opt_price))
-                                as Box<dyn Iterator<Item = Option<f64>>>
-                        }
-                        .collect::<Float64Chunked>();
-
-                        Ok(Some(Series::new("price_ln".into(), transformed)))
+                        let chunked = s
+                            .f64()
+                            .expect("series must contain f64 data")
+                            .into_iter()
+                            .map(|opt_price| opt_price.map(|price| price.ln()))
+                            .collect::<Float64Chunked>();
+                        Ok(Some(Series::new("price_ln".into(), chunked)))
                     },
                     GetOutput::from_type(DataType::Float64),
                 )
@@ -1136,76 +1129,89 @@ mod tests {
     #[test]
     fn test_get_c() {
         // Test 1: Positive values
-        let c1 = 2.0;
-        let c2 = 1.0;
-        let expected = 2.0 / ((1.0 / 2.0_f32).atan()).cos();
-        let result = get_c(c1, c2);
-        assert!((result as f32 - expected).abs() < 1e-6);
+        let result = get_c(2.0, 1.0);
+        let expected = 2.0 / ((1.0_f64 / 2.0).atan()).cos();
+        assert!((result - expected).abs() < 1e-12);
 
         // Test 2: Negative values
-        let c1 = -2.0;
-        let c2 = -1.0;
-        let expected = -2.0 / ((-1.0 / -2.0_f32).atan()).cos();
-        let result = get_c(c1, c2);
-        assert!((result as f32 - expected).abs() < 1e-6);
+        let result = get_c(-2.0, -1.0);
+        let expected = -2.0 / ((0.5_f64).atan()).cos();
+        assert!((result - expected).abs() < 1e-12);
 
-        // Test 3: Zero values
-        let c1 = 1.0;
-        let c2 = 0.0;
-        let expected = 1.0 / (0.0_f32.atan().cos());
-        let result = get_c(c1, c2);
-        assert!((result as f32 - expected).abs() < 1e-6);
+        // Test 3: c2 == 0 leaves c1 unchanged
+        let result = get_c(1.0, 0.0);
+        assert!((result - 1.0).abs() < 1e-12);
     }
 
     // Test for get_oscillations
     #[test]
     fn test_get_oscillations() {
         // Test 1: Regular values
-        let w = 6.28; // Close to 2*pi
-        let tc = 10.0;
-        let t1 = 2.0;
-        let t2 = 8.0;
-        let expected = (6.28 / (2.0 * PI)) * (10.0 - 2.0_f32).ln() / (10.0 - 8.0);
-        let result = get_oscillations(w, tc, t1, t2);
-        assert!((result as f32 - expected).abs() < 1e-6);
+        let w = 6.28;
+        let result = get_oscillations(w, 10.0, 2.0, 8.0);
+        let expected = (w / (2.0 * PI)) * ((10.0_f64 - 2.0) / (10.0 - 8.0)).ln();
+        assert!((result - expected).abs() < 1e-12);
 
-        // Test 2: tc equals t1
-        let tc = 5.0;
-        let t1 = 5.0;
-        let t2 = 3.0;
-        let expected = (6.28 / (2.0 * PI)) * (5.0 - 5.0_f32).ln() / (5.0 - 3.0);
-        let result = get_oscillations(w, tc, t1, t2);
-        assert!(result.is_nan()); // ln(0) should result in NaN
+        // Test 2: tc == t1 makes the ratio 0, and ln(0) is -infinity
+        let result = get_oscillations(w, 5.0, 5.0, 3.0);
+        assert!(result.is_infinite() && result < 0.0);
     }
 
     // Test for get_damping
     #[test]
     fn test_get_damping() {
         // Test 1: Regular values
-        let m: f32 = 1.0;
-        let w: f32 = 2.0;
-        let b: f32 = 0.5;
-        let c: f32 = 1.0;
-        let expected = (m * b.abs()) / (w * c.abs());
-        let result = get_damping(m.into(), w.into(), b.into(), c.into());
-        assert!((result as f32 - expected).abs() < 1e-6);
+        let result = get_damping(1.0, 2.0, 0.5, 1.0);
+        assert!((result - 0.25).abs() < 1e-12);
 
-        // Test 2: Negative values
-        let m: f32 = -1.0;
-        let w: f32 = 2.0;
-        let b: f32 = -0.5;
-        let c: f32 = -1.0;
-        let expected = (-1.0 * 0.5) / (2.0 * 1.0); // Absolute values applied
-        let result = get_damping(m.into(), w.into(), b.into(), c.into());
-        assert!((result as f32 - expected).abs() < 1e-6);
+        // Test 2: Negative values (b and c enter as absolute values)
+        let result = get_damping(-1.0, 2.0, -0.5, -1.0);
+        assert!((result + 0.25).abs() < 1e-12);
 
         // Test 3: Zero damping
-        let m: f32 = 0.0;
-        let w: f32 = 2.0;
-        let b: f32 = 0.5;
-        let c: f32 = 1.0;
-        let expected = 0.0;
-        let result = get_damping(m.into(), w.into(), b.into(), c.into());
-        assert!((result - expected).abs() < 1e-6);
+        let result = get_damping(0.0, 2.0, 0.5, 1.0);
+        assert!(result.abs() < 1e-12);
+    }
+
+    // The fitter should recover known parameters from a noiseless LPPLS
+    // series with near-zero SSE.
+    #[test]
+    fn test_fit_argmin_recovers_synthetic_lppls() {
+        let (tc_true, m_true, w_true) = (130.0, 0.5, 8.0);
+        let (a_true, b_true, c1_true, c2_true) = (1.0, -0.02, 0.002, -0.002);
+
+        let time: Vec<f64> = (0..120).map(|t| t as f64).collect();
+        let price: Vec<f64> = time
+            .iter()
+            .map(|&t| {
+                let dt: f64 = tc_true - t;
+                a_true
+                    + dt.powf(m_true)
+                        * (b_true
+                            + c1_true * (w_true * dt.ln()).cos()
+                            + c2_true * (w_true * dt.ln()).sin())
+            })
+            .collect();
+
+        let (tc, m, w, _a, b, _c1, _c2, cost) =
+            fit_argmin(&time, &price).expect("fit should succeed");
+
+        assert!(cost < 1e-3, "cost too high: {}", cost);
+        assert!((tc - tc_true).abs() < 5.0, "tc off: {}", tc);
+        assert!((m - m_true).abs() < 0.1, "m off: {}", m);
+        assert!((w - w_true).abs() < 0.5, "w off: {}", w);
+        assert!(b < 0.0, "b should be negative for a positive bubble: {}", b);
+    }
+
+    // Too-short or misaligned inputs must error rather than return junk.
+    #[test]
+    fn test_fit_argmin_rejects_bad_input() {
+        let time: Vec<f64> = (0..5).map(|t| t as f64).collect();
+        let price = vec![1.0; 5];
+        assert!(fit_argmin(&time, &price).is_err());
+
+        let time: Vec<f64> = (0..20).map(|t| t as f64).collect();
+        let price = vec![1.0; 19];
+        assert!(fit_argmin(&time, &price).is_err());
     }
 }
