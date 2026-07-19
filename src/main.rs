@@ -5,6 +5,21 @@ use polars::prelude::*;
 use std::{env, error::Error as StdError};
 // use crate::clickhouse_mod::create_score_table;
 
+fn expand_universe(token: &str) -> Vec<String> {
+    let list: Vec<&str> = match token {
+        "SC" => vec!["SC1", "SC2", "SC3", "SC4"],
+        "MC" => vec!["MC1", "MC2"],
+        "LC" => vec!["LC1", "LC2"],
+        "Micro" => vec!["Micro1", "Micro2", "Micro3", "Micro4"],
+        "Stocks" => vec![
+            "SC1", "SC2", "SC3", "SC4", "MC1", "MC2", "LC1", "LC2", "Micro1", "Micro2", "Micro3",
+            "Micro4",
+        ],
+        other => vec![other],
+    };
+    list.into_iter().map(String::from).collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
     // default params (overwritten by command line args)
@@ -29,19 +44,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // only compute what is missing (fits_helper/backtest_helper skip
     // tickers whose files already exist).
     let resume = args.get(4).map(|s| s == "resume").unwrap_or(false);
-    let univ: &[&str] = match univ_str {
-        "SC" => &["SC1", "SC2", "SC3", "SC4"],
-        "MC" => &["MC1", "MC2"],
-        "MC1" => &["MC1"],
-        "LC" => &["LC1", "LC2"],
-        "Micro" => &["Micro1", "Micro2", "Micro3", "Micro4"],
-        "Stocks" => &[
-            "SC1", "SC2", "SC3", "SC4", "MC1", "MC2", "LC1", "LC2", "Micro1", "Micro2", "Micro3",
-            "Micro4",
-        ],
-        _ => &["Crypto"],
-    };
-    let univ_vec: Vec<String> = univ.iter().map(|&s| s.into()).collect();
+    // The universe arg accepts comma-separated groups or single universes,
+    // e.g. "Stocks", "LC,MC", "MC1", "Crypto"
+    let univ_vec: Vec<String> = univ_str.split(',').flat_map(expand_universe).collect();
 
     let overwrite = !resume; // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
     let run_prices = true;
@@ -74,7 +79,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             // println!("folder: {}", folder);
             delete_all_files_in_folder(folder).await?;
         }
-        for u in univ {
+        for u in &univ_vec {
             let _ = fits_helper(path.to_string(), u, batch_size, production).await;
         }
         println!("All Fits done");
@@ -84,7 +89,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // save parquet files to /output/testing or /output/production
     if run_backtests {
         if overwrite {
-            let s = if univ.contains(&"Crypto") {
+            let s = if univ_vec.iter().any(|u| u == "Crypto") {
                 "_crypto"
             } else {
                 ""
@@ -93,7 +98,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             // println!("folder: {}", folder);
             delete_all_files_in_folder(folder).await?;
         }
-        for u in univ {
+        for u in &univ_vec {
             let _ = backtest_helper(path.to_string(), u, batch_size, production).await;
         }
         println!("All Backtests done");
@@ -112,7 +117,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         println!("Done with summary for {}", datetag);
 
         if production {
-            let stocks = if univ.contains(&"Crypto") {
+            let stocks = if univ_vec.iter().any(|u| u == "Crypto") {
                 false
             } else {
                 true
