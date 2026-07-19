@@ -203,12 +203,23 @@ pub fn struct_to_df(res: Vec<FitResult>) -> Result<DataFrame, Box<dyn StdError>>
 }
 
 pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
-    let m_min = 0.0;
-    let m_max = 1.0;
+    // m tightened to (0.01, 0.99) so fits pinned at the theoretical
+    // boundaries do not qualify as bubble evidence.
+    let m_min = 0.01;
+    let m_max = 0.99;
     let w_min = 2.0;
     let w_max = 15.0;
     let O_min = 2.5;
     let D_min = 0.5;
+    // Relative-error gate: drop each ticker's worst fits by per-day MSE.
+    // Within-ticker quantile rather than an absolute RMSE threshold because
+    // absolute values are not comparable across assets: prices are min-max
+    // scaled over the full history, so the same fit quality yields ~3x the
+    // relative RMSE on a 1-year stock series vs a 5-year crypto series.
+    let fit_quantile = 0.90;
+    // Minimum number of qualified windows before a date's confidence is
+    // nonzero — one lucky window out of two should not read as 50%.
+    let min_qual = 2;
 
     let grouped = df
         .lazy()
@@ -250,6 +261,12 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
             (col("D").gt_eq(lit(D_min))).alias("D_in_range"),
             // O_in_range column
             (col("O").gt_eq(lit(O_min))).alias("O_in_range"),
+            // fit_ok column: per-day MSE within the ticker's best fit_quantile
+            ((col("best_cost") / (col("t2") - col("t1") + lit(1.0))).lt_eq(
+                (col("best_cost") / (col("t2") - col("t1") + lit(1.0)))
+                    .quantile(lit(fit_quantile), QuantileInterpolOptions::Linear),
+            ))
+            .alias("fit_ok"),
         ])
         .with_columns(&[
             // is_qualified column
@@ -257,7 +274,8 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
                 .and(col("m_in_range"))
                 .and(col("w_in_range"))
                 .and(col("O_in_range"))
-                .and(col("D_in_range")))
+                .and(col("D_in_range"))
+                .and(col("fit_ok")))
             .alias("is_qualified"),
         ])
         .with_columns(&[
@@ -284,20 +302,28 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
             col("p2").max().alias("price"),
         ])
         .with_columns(&[
-            when(col("pos_count_sum").gt(lit(0)))
-                .then(
-                    col("pos_qual_count_sum").cast(DataType::Float64)
-                        / col("pos_count_sum").cast(DataType::Float64),
-                )
-                .otherwise(lit(0.0))
-                .alias("pos_conf"),
-            when(col("neg_count_sum").gt(lit(0)))
-                .then(
-                    col("neg_qual_count_sum").cast(DataType::Float64)
-                        / col("neg_count_sum").cast(DataType::Float64),
-                )
-                .otherwise(lit(0.0))
-                .alias("neg_conf"),
+            when(
+                col("pos_count_sum")
+                    .gt(lit(0))
+                    .and(col("pos_qual_count_sum").gt_eq(lit(min_qual))),
+            )
+            .then(
+                col("pos_qual_count_sum").cast(DataType::Float64)
+                    / col("pos_count_sum").cast(DataType::Float64),
+            )
+            .otherwise(lit(0.0))
+            .alias("pos_conf"),
+            when(
+                col("neg_count_sum")
+                    .gt(lit(0))
+                    .and(col("neg_qual_count_sum").gt_eq(lit(min_qual))),
+            )
+            .then(
+                col("neg_qual_count_sum").cast(DataType::Float64)
+                    / col("neg_count_sum").cast(DataType::Float64),
+            )
+            .otherwise(lit(0.0))
+            .alias("neg_conf"),
         ])
         .collect()?;
 
@@ -594,11 +620,11 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "mc" || tag == "MC1" || tag == "MC2" {
-                // Recalibrated 2026-07-18: stable positive region at
-                // p1 0.55-0.80, p2 0.20-0.25 (expectancy +12 to +26,
-                // ~50 trades); 0.75/0.20 is top-3 across both passes.
+                // Recalibrated 2026-07-19 (quantile fit gate, m 0.01-0.99,
+                // min 2 qualified windows): positive band at p2 0.15,
+                // p1 0.60-0.80 (expectancy up to +18, ~44-50 trades).
                 let param1: f64 = 0.75;
-                let param2: f64 = 0.20;
+                let param2: f64 = 0.15;
                 let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
@@ -612,11 +638,12 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "lc" || tag == "LC1" || tag == "LC2" {
-                // Recalibrated 2026-07-18: broad flat-top positive region at
-                // p1 0.65-0.80, p2 0.20-0.30 (expectancy +25 to +31,
-                // ~100-145 trades); 0.75/0.25 is central in both passes.
-                let param1: f64 = 0.75;
-                let param2: f64 = 0.25;
+                // Recalibrated 2026-07-19 (quantile fit gate, m 0.01-0.99,
+                // min 2 qualified windows): stable positive region at
+                // p1 0.65-0.75, p2 0.15-0.30 (expectancy +18 to +28);
+                // 0.70/0.20 is the consensus center across three passes.
+                let param1: f64 = 0.70;
+                let param2: f64 = 0.20;
                 let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
