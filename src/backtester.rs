@@ -513,11 +513,14 @@ pub fn summary_performance(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>
             col("buys").mean().alias("buys"),
             col("sells").mean().alias("sells"),
             col("trades").mean().alias("trades"),
+            col("trades").sum().alias("total_trades"),
             col("profit_factor").count().alias("N"),
             col("expectancy").mean().alias("expectancy"),
             col("profit_factor").mean().alias("profit_factor"),
         ])
-        .filter(col("trades").gt(lit(3)))
+        // LPPLS signals are rare by design, so gate on total trades across
+        // the universe (statistical validity), not mean trades per ticker.
+        .filter(col("total_trades").gt_eq(lit(20)))
         .sort(
             vec!["hit_ratio"],
             SortMultipleOptions {

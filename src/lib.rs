@@ -539,7 +539,7 @@ pub async fn run_backtests(
             // Miniimum confidence to be included in the buy / sell list
             let param1: f64 = 0.01;
             let param2: f64 = 0.01;
-            let name = format!("lppl_{}_{}", param1, param2).to_string();
+            let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
             // Use a closure to capture param1 and param2
             let function_with_params =
@@ -552,14 +552,14 @@ pub async fn run_backtests(
                 f: Arc::new(function_with_params),
             });
 
-            // test_0.30_0.35 ┆ SC1      ┆ 36.578564 ┆ 11.066745
-            // test_0.55_0.15 ┆ SC2      ┆ 42.191429 ┆ 12.152326
-            // test_0.50_0.20 ┆ SC3      ┆ 36.69196  ┆ 10.919277
-            // test_0.5_0.15  ┆ SC4      ┆ 48.378861 ┆ 13.336275
+            // Recalibrated 2026-07-18 (percent-return backtest, position-based
+            // exits, subordinated 3D fits). SC had NO profitable (p1, p2) cell
+            // in the grid, so thresholds are set to the least-active corner
+            // (fires almost never) rather than a losing strategy.
             if tag == "sc" || tag == "SC1" || tag == "SC2" || tag == "SC3" || tag == "SC4" {
-                let param1: f64 = 0.3;
-                let param2: f64 = 0.35;
-                let name = format!("lppl_{}_{}", param1, param2).to_string();
+                let param1: f64 = 0.80;
+                let param2: f64 = 0.80;
+                let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params =
@@ -577,13 +577,11 @@ pub async fn run_backtests(
                 || tag == "Micro3"
                 || tag == "Micro4"
             {
-                // test_0.5_0.35  ┆ Micro2   ┆ 29.86627  ┆ 10.916309
-                // test_0.3_0.5   ┆ Micro3   ┆ 30.29165  ┆ 12.218928
-                // test_0.1_0.35  ┆ Micro3   ┆ 50.537557 ┆ 4.311322
-                // test_0.1_0.25  ┆ Micro4   ┆ 50.554766 ┆ 2.709106
-                let param1: f64 = 0.30;
-                let param2: f64 = 0.45;
-                let name = format!("lppl_{}_{}", param1, param2).to_string();
+                // Recalibrated 2026-07-18: Micro had NO profitable (p1, p2)
+                // cell (worst group in the grid); least-active corner chosen.
+                let param1: f64 = 0.80;
+                let param2: f64 = 0.80;
+                let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params =
@@ -596,11 +594,12 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "mc" || tag == "MC1" || tag == "MC2" {
-                // test_0.25_0.5  ┆ MC1      ┆ 36.816127 ┆ 13.128551
-                // test_0.4_0.2   ┆ MC2      ┆ 45.433193 ┆ 11.01682
-                let param1: f64 = 0.35;
-                let param2: f64 = 0.25;
-                let name = format!("lppl_{}_{}", param1, param2).to_string();
+                // Recalibrated 2026-07-18: stable positive region at
+                // p1 0.55-0.80, p2 0.20-0.25 (expectancy +12 to +26,
+                // ~50 trades); 0.75/0.20 is top-3 across both passes.
+                let param1: f64 = 0.75;
+                let param2: f64 = 0.20;
+                let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params =
@@ -613,11 +612,12 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "lc" || tag == "LC1" || tag == "LC2" {
-                // test_0.5_0.25  ┆ LC1      ┆ 36.426602 ┆ 11.894859
-                // test_0.45_0.2  ┆ LC2      ┆ 42.713674 ┆ 12.48582
-                let param1: f64 = 0.30;
-                let param2: f64 = 0.01;
-                let name = format!("lppl_{}_{}", param1, param2).to_string();
+                // Recalibrated 2026-07-18: broad flat-top positive region at
+                // p1 0.65-0.80, p2 0.20-0.30 (expectancy +25 to +31,
+                // ~100-145 trades); 0.75/0.25 is central in both passes.
+                let param1: f64 = 0.75;
+                let param2: f64 = 0.25;
+                let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params =
@@ -630,10 +630,14 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "crypto" || tag == "Crypto" {
-                // test_0.55_0.65 ┆ Crypto   ┆ 29.011567 ┆ 11.219062
-                let param1: f64 = 0.55;
-                let param2: f64 = 0.65;
-                let name = format!("lppl_{}_{}", param1, param2).to_string();
+                // Recalibrated 2026-07-19 (2020+ history): NO profitable
+                // (p1, p2) cell out of 289 — contrarian entries with fixed
+                // exits lose in both directions on crypto (shorting pumps,
+                // buying crashes). Least-active corner chosen; the old
+                // 0.55/0.65 scored -1152 expectancy over 666 trades.
+                let param1: f64 = 0.80;
+                let param2: f64 = 0.80;
+                let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
                 let function_with_params =

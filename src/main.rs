@@ -25,6 +25,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let path = args.get(3).unwrap_or(&default_path);
 
     let production = production_str == "production";
+    // Pass "resume" as the 4th arg to keep existing fit/output files and
+    // only compute what is missing (fits_helper/backtest_helper skip
+    // tickers whose files already exist).
+    let resume = args.get(4).map(|s| s == "resume").unwrap_or(false);
     let univ: &[&str] = match univ_str {
         "SC" => &["SC1", "SC2", "SC3", "SC4"],
         "MC" => &["MC1", "MC2"],
@@ -39,7 +43,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     };
     let univ_vec: Vec<String> = univ.iter().map(|&s| s.into()).collect();
 
-    let overwrite = true; // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
+    let overwrite = !resume; // DELETE OLD FILES BECAUSE THEY WILL NOT BE OVERWRITTEN
     let run_prices = true;
     let run_fits = true;
     let run_backtests = true;

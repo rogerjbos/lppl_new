@@ -215,7 +215,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     -- Step 2: Your original universe selection logic, now applied to the de-duplicated data
                     SELECT
                         baseCurrency ticker,
-                        max(formatDateTime(toTimeZone(date, 'UTC'), '%Y-%m-%d %H:%i:%s')) maxdate
+                        max(formatDateTime(date, '%Y-%m-%d')) maxdate
                     FROM primary_quotes
                     WHERE baseCurrency IN ({})
                     GROUP BY ticker
@@ -223,7 +223,7 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                 )
                 -- Step 3: Final selection, also joining against the de-duplicated data
                 SELECT
-                    formatDateTime(pq.date, '%Y-%m-%d %H:%i:%s') Date,
+                    formatDateTime(pq.date, '%Y-%m-%d') Date,
                     u.ticker Ticker,
                     'Crypto' as Universe,
                     pq.open AS Open,
