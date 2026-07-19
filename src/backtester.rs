@@ -115,6 +115,53 @@ pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
     }
 }
 
+// Normalized-residual signal (arXiv:2510.10878): contrarian entries when
+// eps_norm has exceeded +/-tau for dmin consecutive days. Same one-bar
+// delay convention as signal_fun: the signal at bar i+1 uses data through
+// bar i, and trades execute at the open of the signal bar.
+pub fn res_signal_fun(df: DataFrame, tau: f64, dmin: usize) -> BuySell {
+    let len = df.height();
+    let mut buy = vec![0; len];
+    let mut sell = vec![0; len];
+    let mut pos_conf = vec![0.; len];
+    let mut neg_conf = vec![0.; len];
+
+    let eps = df.column("eps_norm").unwrap().f64().unwrap();
+
+    let mut pos_run = 0usize;
+    let mut neg_run = 0usize;
+    for i in 0..len.saturating_sub(1) {
+        let mut e = eps.get(i).unwrap_or(0.0);
+        if e.is_nan() {
+            e = 0.0;
+        }
+        if e >= tau {
+            pos_run += 1;
+        } else {
+            pos_run = 0;
+        }
+        if e <= -tau {
+            neg_run += 1;
+        } else {
+            neg_run = 0;
+        }
+        if pos_run >= dmin {
+            // price far above the fitted bubble trajectory -> overheated
+            sell[i + 1] = -1;
+        } else if neg_run >= dmin {
+            buy[i + 1] = 1;
+        }
+        pos_conf[i + 1] = e.max(0.0) as f32;
+        neg_conf[i + 1] = (-e).max(0.0) as f32;
+    }
+    BuySell {
+        buy,
+        sell,
+        pos_conf,
+        neg_conf,
+    }
+}
+
 async fn concat_dataframes(dfs: Vec<DataFrame>) -> Result<DataFrame, PolarsError> {
     if dfs.is_empty() {
         return Err(PolarsError::ComputeError(
@@ -884,6 +931,21 @@ mod tests {
         // one long: 100 -> 130 (last close) = +30%
         assert_eq!(bt.trades, 1);
         assert!((bt.max_gain - 30.0).abs() < 1e-9, "max_gain: {}", bt.max_gain);
+    }
+
+    #[test]
+    fn test_res_signal_fun_sustained_threshold() {
+        let eps = vec![0.0, 0.9, 0.9, 0.9, 0.9, -0.9, 0.0, 0.0];
+        let df = polars::df!("eps_norm" => eps).unwrap();
+
+        // tau 0.8, 3-day minimum: the positive run reaches 3 at bar 3, so
+        // sell signals fire at bars 4 and 5. The single -0.9 day never
+        // reaches the 3-day minimum, so no buy fires.
+        let s = res_signal_fun(df, 0.8, 3);
+        assert_eq!(s.sell, vec![0, 0, 0, 0, -1, -1, 0, 0]);
+        assert_eq!(s.buy, vec![0; 8]);
+        assert!((s.pos_conf[2] - 0.9).abs() < 1e-6);
+        assert!((s.neg_conf[6] - 0.9).abs() < 1e-6);
     }
 
     #[test]

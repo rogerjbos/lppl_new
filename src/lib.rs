@@ -4,8 +4,14 @@ use polars::prelude::*;
 use serde::Serialize;
 use std::io::{Cursor, Error, ErrorKind};
 use std::{
-    collections::HashSet, env, error::Error as StdError, f64::consts::PI, fs::File, panic,
-    path::Path, sync::Arc,
+    collections::{BTreeMap, HashSet},
+    env,
+    error::Error as StdError,
+    f64::consts::PI,
+    fs::File,
+    panic,
+    path::Path,
+    sync::Arc,
 };
 use tokio::fs;
 
@@ -330,6 +336,99 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
     Ok(grouped)
 }
 
+/// Indicator days to skip before emitting eps_norm: the running-max
+/// normalization makes the first observation +/-1 by construction, so the
+/// early values are meaningless until the max has stabilized.
+pub const RESIDUAL_BURN_IN: usize = 20;
+
+/// Normalized LPPL residual indicator (arXiv:2510.10878). For each window
+/// end date t2, take the median residual of the observed (scaled log)
+/// price vs the fitted LPPLS value across the nested windows, then
+/// normalize by the running max of |residual| so eps_norm is in [-1, 1].
+/// The paper models residuals as an Ornstein-Uhlenbeck process to justify
+/// boundedness/stationarity; the tradable indicator is eps_norm with a
+/// threshold (paper: 0.8) and a minimum duration (paper: 10 days).
+/// Positive eps_norm = price above the fitted bubble trajectory.
+pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
+    let t2d = df.column("t2_d")?.date()?;
+    let t2 = df.column("t2")?.f64()?;
+    let p2 = df.column("p2")?.f64()?;
+    let tc = df.column("tc")?.f64()?;
+    let m = df.column("m")?.f64()?;
+    let w = df.column("w")?.f64()?;
+    let a = df.column("a")?.f64()?;
+    let b = df.column("b")?.f64()?;
+    let c1 = df.column("c1")?.f64()?;
+    let c2 = df.column("c2")?.f64()?;
+
+    let mut by_date: BTreeMap<i32, Vec<f64>> = BTreeMap::new();
+    for i in 0..df.height() {
+        let (
+            Some(d),
+            Some(t2v),
+            Some(p2v),
+            Some(tcv),
+            Some(mv),
+            Some(wv),
+            Some(av),
+            Some(bv),
+            Some(c1v),
+            Some(c2v),
+        ) = (
+            t2d.get(i),
+            t2.get(i),
+            p2.get(i),
+            tc.get(i),
+            m.get(i),
+            w.get(i),
+            a.get(i),
+            b.get(i),
+            c1.get(i),
+            c2.get(i),
+        )
+        else {
+            continue;
+        };
+        // Same |tc - t| clamp as the fitter, so points near tc cannot NaN
+        let dt = (tcv - t2v).abs().max(1e-8);
+        let log_dt = dt.ln();
+        let fitted =
+            av + dt.powf(mv) * (bv + c1v * (wv * log_dt).cos() + c2v * (wv * log_dt).sin());
+        let eps = p2v - fitted;
+        if eps.is_finite() {
+            by_date.entry(d).or_default().push(eps);
+        }
+    }
+
+    let mut dates: Vec<i32> = Vec::with_capacity(by_date.len());
+    let mut eps_norm: Vec<f64> = Vec::with_capacity(by_date.len());
+    let mut run_max = 0.0f64;
+    for (idx, (d, mut v)) in by_date.into_iter().enumerate() {
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let n = v.len();
+        let med = if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        };
+        run_max = run_max.max(med.abs());
+        let e = if idx < RESIDUAL_BURN_IN || run_max <= 0.0 {
+            0.0
+        } else {
+            med / run_max
+        };
+        dates.push(d);
+        eps_norm.push(e);
+    }
+
+    let out = df!("t2_d_i" => dates, "eps_norm" => eps_norm)?
+        .lazy()
+        .with_column(col("t2_d_i").cast(DataType::Date).alias("t2_d"))
+        .select([col("t2_d"), col("eps_norm")])
+        .collect()?;
+    Ok(out)
+}
+
 pub fn lppls(t: f64, tc: f64, m: f64, w: f64, a: f64, b: f64, c1: f64, c2: f64) -> f64 {
     a + (tc - t).powf(m) * (b + c1 * (w * (tc - t).ln()).cos() + c2 * (w * (tc - t).ln()).sin())
 }
@@ -523,11 +622,14 @@ pub async fn run_backtests(
             .collect();
         // println!("res: {:?}", &res);
 
-        let ind = compute_indicators(res?)?.select(["t2_d", "pos_conf", "neg_conf"])?;
+        let fits_df = res?;
+        let res_ind = compute_residual_indicator(&fits_df)?;
+        let ind = compute_indicators(fits_df)?.select(["t2_d", "pos_conf", "neg_conf"])?;
         let out = df
             .left_join(&ind, ["Date"], ["t2_d"])?
+            .left_join(&res_ind, ["Date"], ["t2_d"])?
             .lazy()
-            .with_column(cols(["pos_conf", "neg_conf"]).fill_null(lit(0.)));
+            .with_column(cols(["pos_conf", "neg_conf", "eps_norm"]).fill_null(lit(0.)));
         // println!("out with ind: {:?}", &out.clone().collect());
 
         // needs to be awaited
@@ -556,6 +658,24 @@ pub async fn run_backtests(
                         param1,
                         param2,
                         f: Arc::new(function_with_params), // Store the closure in the Arc
+                    });
+                }
+            }
+
+            // Normalized-residual strategies (arXiv:2510.10878): long when
+            // eps_norm <= -tau sustained for dmin days, short when >= +tau.
+            // Paper uses tau = 0.7-0.8 entries with a 10-day minimum.
+            for tau in [0.5, 0.6, 0.7, 0.8, 0.9] {
+                for dmin in [1usize, 5, 10] {
+                    let name = format!("res_{:.1}_{}", tau, dmin);
+                    let function_with_params =
+                        move |df: DataFrame| -> BuySell { res_signal_fun(df, tau, dmin) };
+
+                    signals.push(Signal {
+                        name,
+                        param1: tau,
+                        param2: dmin as f64,
+                        f: Arc::new(function_with_params),
                     });
                 }
             }
@@ -1232,6 +1352,42 @@ mod tests {
         assert!((m - m_true).abs() < 0.1, "m off: {}", m);
         assert!((w - w_true).abs() < 0.5, "w off: {}", w);
         assert!(b < 0.0, "b should be negative for a positive bubble: {}", b);
+    }
+
+    #[test]
+    fn test_compute_residual_indicator() {
+        // b = c1 = c2 = 0 makes the fitted value equal a (= 0), so the
+        // residual is exactly p2: a ramp whose |eps| is always the running
+        // max (eps_norm = 1 after burn-in), then a final dip to -0.12
+        // against a running max of 0.24 (eps_norm = -0.5).
+        let n = 25;
+        let dates: Vec<i32> = (0..n as i32).collect();
+        let mut p2: Vec<f64> = (0..n).map(|i| 0.01 * (i as f64 + 1.0)).collect();
+        p2[24] = -0.12;
+        let zeros = vec![0.0; n];
+        let df = polars::df!(
+            "t2_d" => dates,
+            "t2" => vec![100.0; n],
+            "p2" => p2,
+            "tc" => vec![130.0; n],
+            "m" => vec![0.5; n],
+            "w" => vec![8.0; n],
+            "a" => zeros.clone(),
+            "b" => zeros.clone(),
+            "c1" => zeros.clone(),
+            "c2" => zeros,
+        )
+        .unwrap()
+        .lazy()
+        .with_column(col("t2_d").cast(DataType::Date))
+        .collect()
+        .unwrap();
+
+        let out = compute_residual_indicator(&df).unwrap();
+        let e = out.column("eps_norm").unwrap().f64().unwrap();
+        assert_eq!(e.get(5).unwrap(), 0.0, "burn-in should zero early values");
+        assert!((e.get(21).unwrap() - 1.0).abs() < 1e-9);
+        assert!((e.get(24).unwrap() + 0.5).abs() < 1e-9);
     }
 
     // Too-short or misaligned inputs must error rather than return junk.
