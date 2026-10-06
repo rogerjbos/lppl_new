@@ -23,8 +23,12 @@ pub const STOP_LOSS_PCT: f64 = 20.0;
 pub const TC_EXIT_BUFFER_DAYS: f64 = 30.0;
 
 /// Close a position once the entry-side confidence has been at or below
-/// EXIT_CONF_LEVEL for this many consecutive bars: the bubble (or residual
-/// excursion) that justified the trade is no longer detected.
+/// EXIT_CONF_LEVEL for this many consecutive bars: the residual excursion
+/// that justified the trade has reverted. Applies only to trades without a
+/// tc target. LPPLS confidence is intermittent even inside a real bubble, so
+/// for tc-bearing trades this rule fired within days of entry on nearly
+/// every trade and the tc exit never got a chance; those trades run to tc +
+/// TC_EXIT_BUFFER_DAYS, the stop, or MAX_HOLD_BARS instead.
 pub const EXIT_CONF_BARS: usize = 5;
 pub const EXIT_CONF_LEVEL: f64 = 0.0;
 
@@ -787,8 +791,9 @@ pub fn backtest_performance(
     //     2. stop loss: open-to-entry return <= -STOP_LOSS_PCT;
     //     3. tc exit: the bar's time is past the signal's predicted
     //        critical time plus TC_EXIT_BUFFER_DAYS;
-    //     4. confidence exit: entry-side confidence has been at or below
-    //        EXIT_CONF_LEVEL for EXIT_CONF_BARS consecutive bars;
+    //     4. confidence exit (trades with no tc target only): entry-side
+    //        confidence at or below EXIT_CONF_LEVEL for EXIT_CONF_BARS
+    //        consecutive bars;
     //     5. max hold: MAX_HOLD_BARS bars since entry.
     //   Any position still open at the end of the data is marked to market
     //   at the final close.
@@ -841,7 +846,7 @@ pub fn backtest_performance(
                     .as_ref()
                     .and_then(|t| t.get(i))
                     .map_or(false, |ti| ti > tc_target + TC_EXIT_BUFFER_DAYS);
-            let conf_gone = conf_gone_run >= EXIT_CONF_BARS;
+            let conf_gone = !tc_target.is_finite() && conf_gone_run >= EXIT_CONF_BARS;
             let expired = i - entry_bar >= MAX_HOLD_BARS;
 
             let counter: Option<&mut i32> = if is_last {
@@ -1307,6 +1312,26 @@ mod tests {
         let expected = (110.0 / 101.0 - 1.0) * 100.0;
         assert_eq!(bt.trades, 1);
         assert_eq!(bt.exit_conf, 1);
+        assert!((bt.max_gain - expected).abs() < 1e-9, "max_gain: {}", bt.max_gain);
+    }
+
+    #[test]
+    fn test_tc_target_disables_confidence_exit() {
+        // Same setup as test_confidence_exit (confidence gone from bar 6)
+        // but the signal carries a tc target, so the trade must run to the
+        // tc exit at bar 34 instead of closing at bar 10.
+        let n = 60;
+        let (df, mut side) = long_fixture(n, 0.5);
+        for i in 6..n {
+            side.neg_conf[i] = 0.0;
+        }
+        side.exit_time[1] = 1003.0;
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+        let expected = (134.0 / 101.0 - 1.0) * 100.0;
+        assert_eq!(bt.trades, 1);
+        assert_eq!(bt.exit_conf, 0);
+        assert_eq!(bt.exit_tc, 1);
         assert!((bt.max_gain - expected).abs() < 1e-9, "max_gain: {}", bt.max_gain);
     }
 
