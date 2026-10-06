@@ -28,6 +28,15 @@ const M_SEARCH_MAX: f64 = 2.0;
 const W_SEARCH_MIN: f64 = 1.0;
 const W_SEARCH_MAX: f64 = 50.0;
 
+// tc search range as fractions of the window length dt = t2 - t1, around
+// t2: [t2 - TC_SEARCH_LO_FRAC*dt, t2 + TC_SEARCH_HI_FRAC*dt]. Wider than the
+// qualification filter (lib.rs TC_FILTER_*_FRAC: 0.05 / 0.20) for the same
+// reason as m and w. The old range reached 60 days *before* t2: LPPLS is
+// only defined for t < tc, so with |tc - t| those fits were mirrored
+// V-shapes that often won on SSE, got disqualified, and diluted confidence.
+pub const TC_SEARCH_LO_FRAC: f64 = 0.10;
+pub const TC_SEARCH_HI_FRAC: f64 = 0.30;
+
 /// Cost function over the 3 nonlinear parameters (tc, m, w), with the linear
 /// parameters (a, b, c1, c2) subordinated: solved exactly by least squares
 /// inside every cost evaluation (Filimonov & Sornette 2013).
@@ -201,10 +210,9 @@ pub fn fit_argmin(
     let t2s = *shifted.last().unwrap();
     let span = t2s;
 
-    // Same tc range as the tc_in_range qualification filter in
-    // compute_indicators, expressed in shifted time.
-    let tc_lo = (t2s - 60.0).max(t2s - 0.5 * span);
-    let tc_hi = (t2s + 252.0).min(t2s + 0.5 * span);
+    // tc search range in shifted time (see TC_SEARCH_*_FRAC).
+    let tc_lo = t2s - TC_SEARCH_LO_FRAC * span;
+    let tc_hi = t2s + TC_SEARCH_HI_FRAC * span;
 
     let cost = LpplsCostFunction {
         time: shifted.clone(),

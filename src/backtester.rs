@@ -13,6 +13,21 @@ use crate::clickhouse_mod::write_price_file;
 /// this many bars after entry.
 pub const MAX_HOLD_BARS: usize = 126;
 
+/// Stop loss in percent, checked at each bar's open against the entry price.
+pub const STOP_LOSS_PCT: f64 = 20.0;
+
+/// Calendar days past the predicted critical time tc (median tc of the
+/// qualified fits at entry) before a position is closed. tc is the most
+/// probable end of the bubble, so the position is given this long after it
+/// for the move to play out.
+pub const TC_EXIT_BUFFER_DAYS: f64 = 30.0;
+
+/// Close a position once the entry-side confidence has been at or below
+/// EXIT_CONF_LEVEL for this many consecutive bars: the bubble (or residual
+/// excursion) that justified the trade is no longer detected.
+pub const EXIT_CONF_BARS: usize = 5;
+pub const EXIT_CONF_LEVEL: f64 = 0.0;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Backtest {
     pub ticker: String,
@@ -29,6 +44,20 @@ pub struct Backtest {
     pub buys: i32,
     pub sells: i32,
     pub trades: i32,
+    // Per-ticker trade sums so summary_performance can pool trades across
+    // tickers instead of averaging per-ticker ratios.
+    pub wins: i32,
+    pub losses: i32,
+    pub gain_sum: f64,
+    pub loss_sum: f64,
+    pub ret_sq_sum: f64,
+    // Why trades closed, for tuning the exit rules.
+    pub exit_signal: i32,
+    pub exit_stop: i32,
+    pub exit_tc: i32,
+    pub exit_conf: i32,
+    pub exit_hold: i32,
+    pub exit_eod: i32,
     pub date: String,
     pub buy: i32,
     pub sell: i32,
@@ -42,6 +71,14 @@ pub struct BuySell {
     pub sell: Vec<i32>,
     pub pos_conf: Vec<f32>,
     pub neg_conf: Vec<f32>,
+    /// Predicted critical time (same units as the `time` column) attached
+    /// to the signal at that bar; NaN when the signal has none.
+    pub exit_time: Vec<f64>,
+}
+
+/// Optional f64 column accessor for inputs a signal may not carry.
+fn opt_f64(df: &DataFrame, name: &str) -> Option<Float64Chunked> {
+    df.column(name).ok().and_then(|c| c.f64().ok().cloned())
 }
 
 pub fn test() -> Result<(), Box<dyn StdError>> {
@@ -77,32 +114,28 @@ pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
     let mut sell = vec![0; len];
     let mut pos_conf = vec![0.; len];
     let mut neg_conf = vec![0.; len];
+    let mut exit_time = vec![f64::NAN; len];
 
     let pos = df.column("pos_conf").unwrap().f64().unwrap();
     let neg = df.column("neg_conf").unwrap().f64().unwrap();
-    let _close = df.column("Close").unwrap().f64().unwrap();
-
-    // println!("df: {:?}", df.clone());
+    let pos_tc = opt_f64(&df, "pos_tc");
+    let neg_tc = opt_f64(&df, "neg_tc");
+    let tc_at = |col: &Option<Float64Chunked>, i: usize| -> f64 {
+        col.as_ref().and_then(|c| c.get(i)).unwrap_or(f64::NAN)
+    };
 
     for i in 1..len - 1 {
-        let pos_0: f64;
-        let neg_0: f64;
-        if i == len - 2 {
-            pos_0 = pos.get(i + 1).unwrap();
-            neg_0 = neg.get(i + 1).unwrap();
-            // println!("pos {}  neg {}", pos_0, neg_0);
-        } else {
-            pos_0 = pos.get(i).unwrap();
-            neg_0 = neg.get(i).unwrap();
-        }
-        // println!("i of {} : {} pos {} neg {}", i, len.clone(), pos_0, neg_0);
+        // The final bar's signal uses same-day confidence (production list).
+        let src = if i == len - 2 { i + 1 } else { i };
+        let pos_0 = pos.get(src).unwrap();
+        let neg_0 = neg.get(src).unwrap();
 
         if pos_0 > pos_level {
             sell[i + 1] = -1;
-            // println!("sell triggered {} > {}", neg_0, neg_level);
+            exit_time[i + 1] = tc_at(&pos_tc, src);
         } else if neg_0 > neg_level {
             buy[i + 1] = 1;
-            // println!("buy triggered {} > {}", neg_0, neg_level);
+            exit_time[i + 1] = tc_at(&neg_tc, src);
         }
         pos_conf[i + 1] = pos_0 as f32;
         neg_conf[i + 1] = neg_0 as f32;
@@ -112,11 +145,13 @@ pub fn signal_fun(df: DataFrame, pos_level: f64, neg_level: f64) -> BuySell {
         sell,
         pos_conf,
         neg_conf,
+        exit_time,
     }
 }
 
 // Normalized-residual signal (arXiv:2510.10878): contrarian entries when
-// eps_norm has exceeded +/-tau for dmin consecutive days. Same one-bar
+// eps_norm (a residual z-score, see compute_residual_indicator) has
+// exceeded +/-tau for dmin consecutive days. Same one-bar
 // delay convention as signal_fun: the signal at bar i+1 uses data through
 // bar i, and trades execute at the open of the signal bar.
 pub fn res_signal_fun(df: DataFrame, tau: f64, dmin: usize) -> BuySell {
@@ -154,11 +189,14 @@ pub fn res_signal_fun(df: DataFrame, tau: f64, dmin: usize) -> BuySell {
         pos_conf[i + 1] = e.max(0.0) as f32;
         neg_conf[i + 1] = (-e).max(0.0) as f32;
     }
+    // No tc for residual signals: exits come from the confidence rule
+    // (eps_norm reverting to the fitted trajectory), the stop, or max hold.
     BuySell {
         buy,
         sell,
         pos_conf,
         neg_conf,
+        exit_time: vec![f64::NAN; len],
     }
 }
 
@@ -235,6 +273,17 @@ pub async fn summary_performance_file(
         "buys",
         "sells",
         "trades",
+        "wins",
+        "losses",
+        "gain_sum",
+        "loss_sum",
+        "ret_sq_sum",
+        "exit_signal",
+        "exit_stop",
+        "exit_tc",
+        "exit_conf",
+        "exit_hold",
+        "exit_eod",
         "date",
         "buy",
         "sell",
@@ -546,30 +595,106 @@ pub async fn summary_performance_file(
     Ok(datetag)
 }
 
+// Pool all trades of a (strategy, universe) across tickers and compute the
+// metrics on the pool. Averaging per-ticker ratios instead gave each ticker
+// equal weight regardless of trade count, so tickers with a single trade
+// (profit_factor 999 or 0, expectancy +/-2000) dominated the summary.
 pub fn summary_performance(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
+    let f64_ = |name: &str| col(name).cast(DataType::Float64);
+    // population variance of the per-trade returns (clamped at 0 below)
+    let variance = col("ret_sq_sum") / f64_("total_trades") - col("expectancy").pow(lit(2.0));
+
     let out = df
         .lazy()
         .group_by_stable([col("strategy"), col("universe")])
         .agg([
-            col("hit_ratio").mean().alias("hit_ratio"),
-            col("realized_risk_reward").mean().alias("risk_reward"),
-            col("avg_gain").mean().alias("avg_gain"),
-            col("avg_loss").mean().alias("avg_loss"),
-            col("max_gain").mean().alias("max_gain"),
-            col("max_loss").mean().alias("max_loss"),
+            col("ticker").count().alias("N"),
+            col("trades").gt(lit(0)).sum().alias("tickers_traded"),
+            col("trades").sum().alias("total_trades"),
+            col("wins").sum().alias("wins"),
+            col("losses").sum().alias("losses"),
+            col("gain_sum").sum().alias("gain_sum"),
+            col("loss_sum").sum().alias("loss_sum"),
+            col("ret_sq_sum").sum().alias("ret_sq_sum"),
+            col("exit_signal").sum().alias("exit_signal"),
+            col("exit_stop").sum().alias("exit_stop"),
+            col("exit_tc").sum().alias("exit_tc"),
+            col("exit_conf").sum().alias("exit_conf"),
+            col("exit_hold").sum().alias("exit_hold"),
+            col("exit_eod").sum().alias("exit_eod"),
+            col("max_gain").max().alias("max_gain"),
+            col("max_loss").min().alias("max_loss"),
             col("buys").mean().alias("buys"),
             col("sells").mean().alias("sells"),
             col("trades").mean().alias("trades"),
-            col("trades").sum().alias("total_trades"),
-            col("profit_factor").count().alias("N"),
-            col("expectancy").mean().alias("expectancy"),
-            col("profit_factor").mean().alias("profit_factor"),
         ])
         // LPPLS signals are rare by design, so gate on total trades across
         // the universe (statistical validity), not mean trades per ticker.
         .filter(col("total_trades").gt_eq(lit(20)))
+        .with_columns([
+            (f64_("wins") / f64_("total_trades") * lit(100.0)).alias("hit_ratio"),
+            when(col("wins").gt(lit(0)))
+                .then(col("gain_sum") / f64_("wins"))
+                .otherwise(lit(0.0))
+                .alias("avg_gain"),
+            when(col("losses").gt(lit(0)))
+                .then(col("loss_sum") / f64_("losses"))
+                .otherwise(lit(0.0))
+                .alias("avg_loss"),
+            // mean percent return per trade
+            ((col("gain_sum") - col("loss_sum")) / f64_("total_trades")).alias("expectancy"),
+        ])
+        .with_columns([
+            when(col("loss_sum").gt(lit(0.0)))
+                .then(col("gain_sum") / col("loss_sum"))
+                .otherwise(lit(999.0))
+                .alias("profit_factor"),
+            when(col("avg_loss").gt(lit(0.0)))
+                .then(col("avg_gain") / col("avg_loss"))
+                .otherwise(lit(999.0))
+                .alias("risk_reward"),
+            // standard error of the mean return per trade
+            (when(variance.clone().gt(lit(0.0)))
+                .then(variance.clone())
+                .otherwise(lit(0.0))
+                .sqrt()
+                / f64_("total_trades").sqrt())
+            .alias("std_err"),
+        ])
+        .with_column(
+            when(col("std_err").gt(lit(0.0)))
+                .then(col("expectancy") / col("std_err"))
+                .otherwise(lit(0.0))
+                .alias("t_stat"),
+        )
+        .select([
+            col("strategy"),
+            col("universe"),
+            col("hit_ratio"),
+            col("risk_reward"),
+            col("avg_gain"),
+            col("avg_loss"),
+            col("max_gain"),
+            col("max_loss"),
+            col("buys"),
+            col("sells"),
+            col("trades"),
+            col("total_trades"),
+            col("tickers_traded"),
+            col("N"),
+            col("expectancy"),
+            col("std_err"),
+            col("t_stat"),
+            col("profit_factor"),
+            col("exit_signal"),
+            col("exit_stop"),
+            col("exit_tc"),
+            col("exit_conf"),
+            col("exit_hold"),
+            col("exit_eod"),
+        ])
         .sort(
-            vec!["hit_ratio"],
+            vec!["t_stat"],
             SortMultipleOptions {
                 descending: vec![false],
                 ..Default::default()
@@ -657,17 +782,35 @@ pub fn backtest_performance(
     // - A buy signal opens a long, a sell signal opens a short.
     // - Repeated same-direction signals while a position is open are
     //   ignored (no chaining into 1-bar trades).
-    // - An opposite signal closes the position at that bar's open and
-    //   reverses into the new direction.
-    // - A position is closed after MAX_HOLD_BARS bars, and any position
-    //   still open at the end of the data is marked to market at the
-    //   final close.
+    // - Exits are checked at each bar's open, in this priority:
+    //     1. an opposite signal closes and reverses into the new direction;
+    //     2. stop loss: open-to-entry return <= -STOP_LOSS_PCT;
+    //     3. tc exit: the bar's time is past the signal's predicted
+    //        critical time plus TC_EXIT_BUFFER_DAYS;
+    //     4. confidence exit: entry-side confidence has been at or below
+    //        EXIT_CONF_LEVEL for EXIT_CONF_BARS consecutive bars;
+    //     5. max hold: MAX_HOLD_BARS bars since entry.
+    //   Any position still open at the end of the data is marked to market
+    //   at the final close.
     // - The final bar's signal is derived from same-day confidence (kept
     //   for the production buy/sell list), so the backtest ignores it.
+    let time = opt_f64(&df, "time");
+    let pct = |position: i32, entry: f64, exit: f64| -> f64 {
+        if position == 1 {
+            (exit / entry - 1.0) * 100.0
+        } else {
+            (entry - exit) / entry * 100.0
+        }
+    };
+
     let mut trade_results: Vec<f64> = Vec::new();
     let mut position: i32 = 0; // 0 = flat, 1 = long, -1 = short
     let mut entry_price = f64::NAN;
     let mut entry_bar: usize = 0;
+    let mut tc_target = f64::NAN;
+    let mut conf_gone_run: usize = 0;
+    let (mut exit_signal, mut exit_stop, mut exit_tc, mut exit_conf, mut exit_hold, mut exit_eod) =
+        (0, 0, 0, 0, 0, 0);
 
     for i in 0..len {
         let is_last = i == len - 1;
@@ -675,24 +818,60 @@ pub fn backtest_performance(
         let sell_sig = !is_last && side.sell[i] == -1;
 
         if position != 0 {
+            let open_i = open.get(i).unwrap_or(f64::NAN);
+            // Entry-side confidence at this bar (data through the prior close).
+            let conf = if position == 1 {
+                side.neg_conf.get(i)
+            } else {
+                side.pos_conf.get(i)
+            }
+            .copied()
+            .unwrap_or(0.0) as f64;
+            if conf <= EXIT_CONF_LEVEL {
+                conf_gone_run += 1;
+            } else {
+                conf_gone_run = 0;
+            }
+
             let opposite = (position == 1 && sell_sig) || (position == -1 && buy_sig);
+            let open_ret = pct(position, entry_price, open_i);
+            let stopped = open_ret.is_finite() && open_ret <= -STOP_LOSS_PCT;
+            let past_tc = tc_target.is_finite()
+                && time
+                    .as_ref()
+                    .and_then(|t| t.get(i))
+                    .map_or(false, |ti| ti > tc_target + TC_EXIT_BUFFER_DAYS);
+            let conf_gone = conf_gone_run >= EXIT_CONF_BARS;
             let expired = i - entry_bar >= MAX_HOLD_BARS;
-            if opposite || expired || is_last {
+
+            let counter: Option<&mut i32> = if is_last {
+                Some(&mut exit_eod)
+            } else if opposite {
+                Some(&mut exit_signal)
+            } else if stopped {
+                Some(&mut exit_stop)
+            } else if past_tc {
+                Some(&mut exit_tc)
+            } else if conf_gone {
+                Some(&mut exit_conf)
+            } else if expired {
+                Some(&mut exit_hold)
+            } else {
+                None
+            };
+            if let Some(counter) = counter {
                 let exit_price = if is_last {
                     close.get(i).unwrap_or(f64::NAN)
                 } else {
-                    open.get(i).unwrap_or(f64::NAN)
+                    open_i
                 };
                 if entry_price > 0.0 && exit_price.is_finite() {
-                    let ret = if position == 1 {
-                        (exit_price / entry_price - 1.0) * 100.0
-                    } else {
-                        (entry_price - exit_price) / entry_price * 100.0
-                    };
-                    trade_results.push(ret);
+                    trade_results.push(pct(position, entry_price, exit_price));
                 }
+                *counter += 1;
                 position = 0;
                 entry_price = f64::NAN;
+                tc_target = f64::NAN;
             }
         }
 
@@ -702,6 +881,8 @@ pub fn backtest_performance(
                 position = if buy_sig { 1 } else { -1 };
                 entry_price = price;
                 entry_bar = i;
+                tc_target = side.exit_time.get(i).copied().unwrap_or(f64::NAN);
+                conf_gone_run = 0;
             }
         }
     }
@@ -746,7 +927,7 @@ pub fn backtest_performance(
         if ag.is_nan() {
             0.0
         } else {
-            f64::min(100., ag)
+            ag
         }
     };
     let average_loss: f64 = {
@@ -754,7 +935,7 @@ pub fn backtest_performance(
         if al.is_nan() {
             0.0
         } else {
-            f64::max(-100., al)
+            al
         }
     };
     let realized_risk_reward: f64 = {
@@ -762,19 +943,19 @@ pub fn backtest_performance(
         if rr.is_nan() {
             0.0
         } else {
-            f64::min(100., rr)
+            f64::min(999., rr)
         }
     };
     let trades: i32 = trade_results.len() as i32;
+    let wins = total_net_profits.len() as i32;
+    let losses = total_net_losses.len() as i32;
+    let ret_sq_sum: f64 = trade_results.iter().map(|r| r * r).sum();
 
-    // Expectancy
-    let expectancy = {
-        let ex = (average_gain * hit_ratio) - ((100. - hit_ratio) * average_loss);
-        if ex.is_nan() {
-            0.0
-        } else {
-            f64::min(999., ex)
-        }
+    // Expectancy: mean percent return per trade
+    let expectancy = if trades > 0 {
+        (sum_total_net_profits - sum_total_net_losses) / trades as f64
+    } else {
+        0.0
     };
 
     let max_gain = total_net_profits
@@ -840,6 +1021,17 @@ pub fn backtest_performance(
         buys: buys,
         sells: sells,
         trades: trades,
+        wins,
+        losses,
+        gain_sum: sum_total_net_profits,
+        loss_sum: sum_total_net_losses,
+        ret_sq_sum,
+        exit_signal,
+        exit_stop,
+        exit_tc,
+        exit_conf,
+        exit_hold,
+        exit_eod,
         date: date,
         buy: buy,
         sell: sell,
@@ -893,6 +1085,7 @@ mod tests {
             sell: vec![0, 0, 0, -1, 0, -1],
             pos_conf: vec![0.0; 6],
             neg_conf: vec![0.0; 6],
+            exit_time: vec![f64::NAN; 6],
         };
 
         let bt = backtest_performance(df, side, "test").unwrap();
@@ -904,6 +1097,74 @@ mod tests {
         assert!((bt.hit_ratio - 100.0).abs() < 1e-9);
         assert_eq!(bt.buys, 1);
         assert_eq!(bt.sells, 2);
+        // pooling sums: 2 wins, +45% total, no losses, mean +22.5%/trade
+        assert_eq!(bt.wins, 2);
+        assert_eq!(bt.losses, 0);
+        assert!((bt.gain_sum - 45.0).abs() < 1e-9);
+        assert!((bt.loss_sum - 0.0).abs() < 1e-9);
+        assert!((bt.ret_sq_sum - (400.0 + 625.0)).abs() < 1e-9);
+        assert!((bt.expectancy - 22.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_summary_performance_pools_trades() {
+        // Ticker A: 3 trades (+10, +20, -10). Ticker B: 1 trade (-30).
+        // Equal-weighted per-ticker means would give hit_ratio 33% and a
+        // profit factor dominated by B's 0; pooled: 2 wins of 4 = 50%,
+        // gains 30 vs losses 40, mean per trade -2.5%.
+        let mk = |ticker: &str, trades: i32, wins: i32, gain: f64, loss: f64, sq: f64| Backtest {
+            ticker: ticker.to_string(),
+            universe: "U".to_string(),
+            strategy: "s".to_string(),
+            expectancy: 0.0,
+            profit_factor: 0.0,
+            hit_ratio: 0.0,
+            realized_risk_reward: 0.0,
+            avg_gain: 0.0,
+            avg_loss: 0.0,
+            max_gain: gain,
+            max_loss: -loss,
+            buys: trades,
+            sells: 0,
+            trades,
+            wins,
+            losses: trades - wins,
+            gain_sum: gain,
+            loss_sum: loss,
+            ret_sq_sum: sq,
+            exit_signal: 0,
+            exit_stop: 0,
+            exit_tc: 0,
+            exit_conf: 0,
+            exit_hold: trades,
+            exit_eod: 0,
+            date: "d".to_string(),
+            buy: 0,
+            sell: 0,
+            pos_conf: 0.0,
+            neg_conf: 0.0,
+        };
+        // 20 copies of A-like tickers plus B to clear the 20-trade gate:
+        // 20 * (3 trades: 2 wins +30, 1 loss 10) + B (1 loss 30)
+        let mut rows: Vec<Backtest> = (0..20)
+            .map(|i| mk(&format!("A{}", i), 3, 2, 30.0, 10.0, 100.0 + 400.0 + 100.0))
+            .collect();
+        rows.push(mk("B", 1, 0, 0.0, 30.0, 900.0));
+
+        let json = serde_json::to_string(&rows).unwrap();
+        let df = JsonReader::new(Cursor::new(json)).finish().unwrap();
+        let out = summary_performance(df).unwrap();
+        assert_eq!(out.height(), 1);
+
+        let get = |c: &str| out.column(c).unwrap().get(0).unwrap().try_extract::<f64>().unwrap();
+        let total = 61.0;
+        let wins = 40.0;
+        assert!((get("hit_ratio") - wins / total * 100.0).abs() < 1e-9);
+        assert!((get("avg_gain") - 600.0 / 40.0).abs() < 1e-9);
+        assert!((get("avg_loss") - 230.0 / 21.0).abs() < 1e-9);
+        assert!((get("expectancy") - (600.0 - 230.0) / total).abs() < 1e-9);
+        assert!((get("profit_factor") - 600.0 / 230.0).abs() < 1e-9);
+        assert!(get("std_err") > 0.0);
     }
 
     #[test]
@@ -924,6 +1185,7 @@ mod tests {
             sell: vec![0, 0, 0, 0, 0, 0],
             pos_conf: vec![0.0; 6],
             neg_conf: vec![0.0; 6],
+            exit_time: vec![f64::NAN; 6],
         };
 
         let bt = backtest_performance(df, side, "test").unwrap();
@@ -966,11 +1228,13 @@ mod tests {
         )
         .unwrap();
 
+        // Confidence stays up so the confidence exit does not fire first.
         let side = BuySell {
             buy,
             sell: vec![0; n],
             pos_conf: vec![0.0; n],
-            neg_conf: vec![0.0; n],
+            neg_conf: vec![0.5; n],
+            exit_time: vec![f64::NAN; n],
         };
 
         let bt = backtest_performance(df, side, "test").unwrap();
@@ -979,12 +1243,123 @@ mod tests {
         // open[1 + MAX_HOLD_BARS] = 101 + 126 = 227.
         let expected = (227.0 / 101.0 - 1.0) * 100.0;
         assert_eq!(bt.trades, 1);
+        assert_eq!(bt.exit_hold, 1);
         assert!(
             (bt.max_gain - expected).abs() < 1e-9,
             "max_gain: {} expected: {}",
             bt.max_gain,
             expected
         );
+    }
+
+    /// Rising price series with a `time` column of consecutive days, a
+    /// single buy at bar 1, and constant entry-side confidence.
+    fn long_fixture(n: usize, neg_conf: f32) -> (DataFrame, BuySell) {
+        let dates: Vec<String> = (0..n).map(|i| format!("d{}", i)).collect();
+        let opens: Vec<f64> = (0..n).map(|i| 100.0 + i as f64).collect();
+        let time: Vec<f64> = (0..n).map(|i| 1000.0 + i as f64).collect();
+        let df = polars::df!(
+            "Date" => dates,
+            "Ticker" => vec!["TST"; n],
+            "Universe" => vec!["U"; n],
+            "Open" => opens.clone(),
+            "Close" => opens,
+            "time" => time,
+        )
+        .unwrap();
+        let mut buy = vec![0; n];
+        buy[1] = 1;
+        let side = BuySell {
+            buy,
+            sell: vec![0; n],
+            pos_conf: vec![0.0; n],
+            neg_conf: vec![neg_conf; n],
+            exit_time: vec![f64::NAN; n],
+        };
+        (df, side)
+    }
+
+    #[test]
+    fn test_tc_exit() {
+        let n = 60;
+        let (df, mut side) = long_fixture(n, 0.5);
+        // predicted tc two days after entry (time 1001): exit at the first
+        // bar past 1003 + 30 = 1033, i.e. bar 34 (time 1034), open 134.
+        side.exit_time[1] = 1003.0;
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+        let expected = (134.0 / 101.0 - 1.0) * 100.0;
+        assert_eq!(bt.trades, 1);
+        assert_eq!(bt.exit_tc, 1);
+        assert!((bt.max_gain - expected).abs() < 1e-9, "max_gain: {}", bt.max_gain);
+    }
+
+    #[test]
+    fn test_confidence_exit() {
+        let n = 30;
+        let (df, mut side) = long_fixture(n, 0.5);
+        // confidence disappears from bar 6 on; the 5th zero bar is bar 10
+        for i in 6..n {
+            side.neg_conf[i] = 0.0;
+        }
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+        let expected = (110.0 / 101.0 - 1.0) * 100.0;
+        assert_eq!(bt.trades, 1);
+        assert_eq!(bt.exit_conf, 1);
+        assert!((bt.max_gain - expected).abs() < 1e-9, "max_gain: {}", bt.max_gain);
+    }
+
+    #[test]
+    fn test_stop_loss_exit() {
+        let n = 20;
+        let dates: Vec<String> = (0..n).map(|i| format!("d{}", i)).collect();
+        let mut opens = vec![100.0; n];
+        // entry at open[1] = 100; -21% at bar 5 breaches the 20% stop
+        opens[2] = 95.0;
+        opens[3] = 90.0;
+        opens[4] = 85.0;
+        opens[5] = 79.0;
+        let time: Vec<f64> = (0..n).map(|i| 1000.0 + i as f64).collect();
+        let df = polars::df!(
+            "Date" => dates,
+            "Ticker" => vec!["TST"; n],
+            "Universe" => vec!["U"; n],
+            "Open" => opens.clone(),
+            "Close" => opens,
+            "time" => time,
+        )
+        .unwrap();
+        let mut buy = vec![0; n];
+        buy[1] = 1;
+        let side = BuySell {
+            buy,
+            sell: vec![0; n],
+            pos_conf: vec![0.0; n],
+            neg_conf: vec![0.5; n],
+            exit_time: vec![f64::NAN; n],
+        };
+
+        let bt = backtest_performance(df, side, "test").unwrap();
+        assert_eq!(bt.trades, 1);
+        assert_eq!(bt.exit_stop, 1);
+        assert!((bt.max_loss + 21.0).abs() < 1e-9, "max_loss: {}", bt.max_loss);
+    }
+
+    #[test]
+    fn test_signal_fun_carries_tc() {
+        // pos_conf above the level at bar 2 -> sell at bar 3 carrying pos_tc
+        let df = polars::df!(
+            "pos_conf" => &[0.0, 0.0, 0.9, 0.0, 0.0, 0.0],
+            "neg_conf" => &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "pos_tc" => &[None, None, Some(1234.0), None, None, None],
+            "neg_tc" => &[None::<f64>; 6],
+        )
+        .unwrap();
+        let s = signal_fun(df, 0.5, 0.5);
+        assert_eq!(s.sell, vec![0, 0, 0, -1, 0, 0]);
+        assert_eq!(s.exit_time[3], 1234.0);
+        assert!(s.exit_time[2].is_nan());
     }
 }
 

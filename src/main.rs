@@ -102,6 +102,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             let _ = backtest_helper(path.to_string(), u, batch_size, production).await;
         }
         println!("All Backtests done");
+
+        // testing fit files are only needed as backtest input and take up a lot
+        // of space, so delete them once the backtests are done
+        if !production {
+            let folder = format!("{}/fit/{}", path, production_str);
+            delete_all_files_in_folder(&folder).await?;
+            println!("Deleted fit files in {}", folder);
+        }
     }
 
     // SHOW AGGREGATED RESULTS BY STRATEGY

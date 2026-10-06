@@ -43,7 +43,29 @@ pub struct FitResult {
     D: f64,
     p2: f64,
     best_cost: f64,
+    /// 1 - SSE/SST of the window: scale-free fit quality, comparable across
+    /// tickers and between testing and production.
+    r2: f64,
+    /// Observations in the window (for the residual standard error).
+    n_obs: usize,
 }
+
+/// Qualification range for tc as fractions of the window length dt = t2 - t1:
+/// [t2 - TC_FILTER_LO_FRAC*dt, t2 + TC_FILTER_HI_FRAC*dt]. Literature values
+/// run from (0.05, 0.10) (Sornette et al. 2015) to (0.20, 0.20) (Demos &
+/// Sornette 2017). Narrower than the fitter's search box so that fits whose
+/// SSE minimum lies outside are found there and disqualified rather than
+/// pinned to the boundary.
+pub const TC_FILTER_LO_FRAC: f64 = 0.05;
+pub const TC_FILTER_HI_FRAC: f64 = 0.20;
+
+/// Minimum R^2 for a nested fit to count as qualified. An absolute gate so
+/// that testing (years of fits) and production (one day, 18 fits) apply the
+/// same standard. Calibrated 2026-10-06 with `cargo run --example
+/// calibrate_r2 production` over 21,747 LC/MC fits: q10 = 0.665, median
+/// 0.857, nearly flat across window lengths. 0.65 passes ~91% of fits,
+/// matching the pass rate of the per-file 90% quantile gate it replaces.
+pub const FIT_R2_MIN: f64 = 0.65;
 
 fn file_exists(path: &str) -> bool {
     Path::new(path).exists()
@@ -160,6 +182,18 @@ pub fn compute_nested_fits(
                     let c = get_c(c1, c2);
                     let O = get_oscillations(w, tc, nested_t1, nested_t2);
                     let D = get_damping(m, w, b, c);
+                    let n = price_shrinking_slice.len() as f64;
+                    let mean = price_shrinking_slice.iter().sum::<f64>() / n;
+                    let sst: f64 = price_shrinking_slice
+                        .iter()
+                        .map(|p| (p - mean).powi(2))
+                        .sum();
+                    // flat window: no variance to explain, never qualifies
+                    let r2 = if sst > 0.0 {
+                        1.0 - best_cost / sst
+                    } else {
+                        f64::NAN
+                    };
 
                     res.push(FitResult {
                         tc_d: ordinal_to_date(tc),
@@ -179,6 +213,8 @@ pub fn compute_nested_fits(
                         D,
                         p2,
                         best_cost,
+                        r2,
+                        n_obs: price_shrinking_slice.len(),
                     });
                     // println!("i: {} j: {} best_cost: {}", i, j, best_cost);
                 } else {
@@ -208,7 +244,10 @@ pub fn struct_to_df(res: Vec<FitResult>) -> Result<DataFrame, Box<dyn StdError>>
     Ok(df)
 }
 
-pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
+/// Per-fit qualification flags: the Sornette-style parameter filter plus the
+/// R^2 gate, with `is_qualified` and the signed count helpers. Shared by the
+/// confidence indicator and the residual indicator.
+pub fn qualify_fits(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
     // m tightened to (0.01, 0.99) so fits pinned at the theoretical
     // boundaries do not qualify as bubble evidence.
     let m_min = 0.01;
@@ -217,42 +256,20 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
     let w_max = 15.0;
     let O_min = 2.5;
     let D_min = 0.5;
-    // Relative-error gate: drop each ticker's worst fits by per-day MSE.
-    // Within-ticker quantile rather than an absolute RMSE threshold because
-    // absolute values are not comparable across assets: prices are min-max
-    // scaled over the full history, so the same fit quality yields ~3x the
-    // relative RMSE on a 1-year stock series vs a 5-year crypto series.
-    let fit_quantile = 0.90;
-    // Minimum number of qualified windows before a date's confidence is
-    // nonzero — one lucky window out of two should not read as 50%.
-    let min_qual = 2;
+    // Fit-quality gate: absolute R^2 threshold (FIT_R2_MIN). The previous
+    // within-file MSE quantile behaved differently in testing (quantile over
+    // years of fits, including future ones) and production (quantile over
+    // the single day's 18 fits), so production confidence was not the thing
+    // that had been backtested. R^2 is invariant to the price scaling.
 
-    let grouped = df
+    let dt = col("t2") - col("t1");
+    let out = df
         .lazy()
         .with_columns(&[
-            // tc_in_range column
-            when(
-                (col("tc").gt_eq(
-                    when(
-                        (col("t2") - lit(60.0))
-                            .gt_eq(col("t2") - lit(0.5) * (col("t2") - col("t1"))),
-                    )
-                    .then(col("t2") - lit(60.0))
-                    .otherwise(col("t2") - lit(0.5) * (col("t2") - col("t1"))),
-                ))
-                .and(
-                    col("tc").lt_eq(
-                        when(
-                            (col("t2") + lit(252.0))
-                                .lt_eq(col("t2") + lit(0.5) * (col("t2") - col("t1"))),
-                        )
-                        .then(col("t2") + lit(252.0))
-                        .otherwise(col("t2") + lit(0.5) * (col("t2") - col("t1"))),
-                    ),
-                ),
-            )
-            .then(lit(true))
-            .otherwise(lit(false))
+            // tc_in_range column (see TC_FILTER_*_FRAC)
+            (col("tc")
+                .gt_eq(col("t2") - lit(TC_FILTER_LO_FRAC) * dt.clone())
+                .and(col("tc").lt_eq(col("t2") + lit(TC_FILTER_HI_FRAC) * dt)))
             .alias("tc_in_range"),
             // m_in_range column
             (col("m").gt_eq(lit(m_min)).and(col("m").lt_eq(lit(m_max)))).alias("m_in_range"),
@@ -267,12 +284,8 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
             (col("D").gt_eq(lit(D_min))).alias("D_in_range"),
             // O_in_range column
             (col("O").gt_eq(lit(O_min))).alias("O_in_range"),
-            // fit_ok column: per-day MSE within the ticker's best fit_quantile
-            ((col("best_cost") / (col("t2") - col("t1") + lit(1.0))).lt_eq(
-                (col("best_cost") / (col("t2") - col("t1") + lit(1.0)))
-                    .quantile(lit(fit_quantile), QuantileInterpolOptions::Linear),
-            ))
-            .alias("fit_ok"),
+            // fit_ok column: window R^2 at or above the absolute gate
+            col("r2").gt_eq(lit(FIT_R2_MIN)).alias("fit_ok"),
         ])
         .with_columns(&[
             // is_qualified column
@@ -299,6 +312,17 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
                 .and(col("is_qualified"))
                 .alias("neg_qual_count"),
         ])
+        .collect()?;
+    Ok(out)
+}
+
+pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
+    // Minimum number of qualified windows before a date's confidence is
+    // nonzero — one lucky window out of two should not read as 50%.
+    let min_qual = 2;
+
+    let grouped = qualify_fits(df)?
+        .lazy()
         .group_by([col("t2_d")])
         .agg([
             col("pos_count").sum().alias("pos_count_sum"),
@@ -306,6 +330,19 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
             col("neg_count").sum().alias("neg_count_sum"),
             col("neg_qual_count").sum().alias("neg_qual_count_sum"),
             col("p2").max().alias("price"),
+            // Predicted critical time per side: median tc of the qualified
+            // fits. Null when no fit on that side qualifies. Used by the
+            // backtest to close positions once tc has passed.
+            when(col("pos_qual_count"))
+                .then(col("tc"))
+                .otherwise(lit(NULL))
+                .median()
+                .alias("pos_tc"),
+            when(col("neg_qual_count"))
+                .then(col("tc"))
+                .otherwise(lit(NULL))
+                .median()
+                .alias("neg_tc"),
         ])
         .with_columns(&[
             when(
@@ -336,20 +373,28 @@ pub fn compute_indicators(df: DataFrame) -> Result<DataFrame, Box<dyn StdError>>
     Ok(grouped)
 }
 
-/// Indicator days to skip before emitting eps_norm: the running-max
-/// normalization makes the first observation +/-1 by construction, so the
-/// early values are meaningless until the max has stabilized.
-pub const RESIDUAL_BURN_IN: usize = 20;
+/// Number of LPPLS parameters, for the residual degrees of freedom.
+const LPPLS_PARAMS: usize = 7;
 
-/// Normalized LPPL residual indicator (arXiv:2510.10878). For each window
-/// end date t2, take the median residual of the observed (scaled log)
-/// price vs the fitted LPPLS value across the nested windows, then
-/// normalize by the running max of |residual| so eps_norm is in [-1, 1].
-/// The paper models residuals as an Ornstein-Uhlenbeck process to justify
-/// boundedness/stationarity; the tradable indicator is eps_norm with a
-/// threshold (paper: 0.8) and a minimum duration (paper: 10 days).
-/// Positive eps_norm = price above the fitted bubble trajectory.
+/// Normalized LPPL residual indicator (after arXiv:2510.10878). For each
+/// qualified fit, the residual of the observed (scaled log) price at t2
+/// against the fitted LPPLS value, divided by that fit's residual standard
+/// error sqrt(SSE / (n - 7)); eps_norm for the date is the median of those
+/// z-scores across the nested windows. Positive = price above the fitted
+/// bubble trajectory. Only qualified fits contribute: the residual relative
+/// to a trajectory that is not a plausible bubble carries no information.
+///
+/// Replaces a running-max normalization that (a) needed a 20-date burn-in,
+/// so production (one t2 date) always produced 0, (b) was non-stationary,
+/// one early outlier shrank the indicator permanently, and (c) pooled
+/// residuals from disqualified fits. The z-score needs no history, so
+/// production and testing compute the same quantity.
 pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn StdError>> {
+    let df = qualify_fits(df.clone())?
+        .lazy()
+        .filter(col("is_qualified"))
+        .collect()?;
+
     let t2d = df.column("t2_d")?.date()?;
     let t2 = df.column("t2")?.f64()?;
     let p2 = df.column("p2")?.f64()?;
@@ -360,6 +405,9 @@ pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn S
     let b = df.column("b")?.f64()?;
     let c1 = df.column("c1")?.f64()?;
     let c2 = df.column("c2")?.f64()?;
+    let sse = df.column("best_cost")?.f64()?;
+    let n_obs = df.column("n_obs")?.cast(&DataType::Int64)?;
+    let n_obs = n_obs.i64()?;
 
     let mut by_date: BTreeMap<i32, Vec<f64>> = BTreeMap::new();
     for i in 0..df.height() {
@@ -374,6 +422,8 @@ pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn S
             Some(bv),
             Some(c1v),
             Some(c2v),
+            Some(ssev),
+            Some(nv),
         ) = (
             t2d.get(i),
             t2.get(i),
@@ -385,6 +435,8 @@ pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn S
             b.get(i),
             c1.get(i),
             c2.get(i),
+            sse.get(i),
+            n_obs.get(i),
         )
         else {
             continue;
@@ -394,16 +446,20 @@ pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn S
         let log_dt = dt.ln();
         let fitted =
             av + dt.powf(mv) * (bv + c1v * (wv * log_dt).cos() + c2v * (wv * log_dt).sin());
-        let eps = p2v - fitted;
-        if eps.is_finite() {
-            by_date.entry(d).or_default().push(eps);
+        let dof = (nv as usize).saturating_sub(LPPLS_PARAMS).max(1) as f64;
+        let sigma = (ssev / dof).sqrt();
+        if sigma <= 0.0 {
+            continue;
+        }
+        let z = (p2v - fitted) / sigma;
+        if z.is_finite() {
+            by_date.entry(d).or_default().push(z);
         }
     }
 
     let mut dates: Vec<i32> = Vec::with_capacity(by_date.len());
     let mut eps_norm: Vec<f64> = Vec::with_capacity(by_date.len());
-    let mut run_max = 0.0f64;
-    for (idx, (d, mut v)) in by_date.into_iter().enumerate() {
+    for (d, mut v) in by_date.into_iter() {
         v.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let n = v.len();
         let med = if n % 2 == 1 {
@@ -411,14 +467,8 @@ pub fn compute_residual_indicator(df: &DataFrame) -> Result<DataFrame, Box<dyn S
         } else {
             0.5 * (v[n / 2 - 1] + v[n / 2])
         };
-        run_max = run_max.max(med.abs());
-        let e = if idx < RESIDUAL_BURN_IN || run_max <= 0.0 {
-            0.0
-        } else {
-            med / run_max
-        };
         dates.push(d);
-        eps_norm.push(e);
+        eps_norm.push(med);
     }
 
     let out = df!("t2_d_i" => dates, "eps_norm" => eps_norm)?
@@ -593,7 +643,7 @@ pub async fn run_backtests(
         ticker
     );
 
-    let mut schema = Schema::with_capacity(17);
+    let mut schema = Schema::with_capacity(18);
     schema.with_column("tc_d".into(), DataType::Date);
     schema.with_column("tc".into(), DataType::Float64);
     schema.with_column("m".into(), DataType::Float64);
@@ -611,6 +661,8 @@ pub async fn run_backtests(
     schema.with_column("D".into(), DataType::Float64);
     schema.with_column("p2".into(), DataType::Float64);
     schema.with_column("best_cost".into(), DataType::Float64);
+    schema.with_column("r2".into(), DataType::Float64);
+    schema.with_column("n_obs".into(), DataType::Int64);
 
     if file_exists(&fname) {
         // println!("File exists!");
@@ -624,7 +676,8 @@ pub async fn run_backtests(
 
         let fits_df = res?;
         let res_ind = compute_residual_indicator(&fits_df)?;
-        let ind = compute_indicators(fits_df)?.select(["t2_d", "pos_conf", "neg_conf"])?;
+        let ind = compute_indicators(fits_df)?
+            .select(["t2_d", "pos_conf", "neg_conf", "pos_tc", "neg_tc"])?;
         let out = df
             .left_join(&ind, ["Date"], ["t2_d"])?
             .left_join(&res_ind, ["Date"], ["t2_d"])?
@@ -664,8 +717,10 @@ pub async fn run_backtests(
 
             // Normalized-residual strategies (arXiv:2510.10878): long when
             // eps_norm <= -tau sustained for dmin days, short when >= +tau.
-            // Paper uses tau = 0.7-0.8 entries with a 10-day minimum.
-            for tau in [0.5, 0.6, 0.7, 0.8, 0.9] {
+            // eps_norm is a residual z-score (see compute_residual_indicator),
+            // so tau is in standard errors rather than the paper's [-1, 1]
+            // running-max scale.
+            for tau in [1.0, 1.5, 2.0, 2.5, 3.0] {
                 for dmin in [1usize, 5, 10] {
                     let name = format!("res_{:.1}_{}", tau, dmin);
                     let function_with_params =
@@ -1276,6 +1331,57 @@ pub async fn fits_helper(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_compute_indicators_confidence_and_tc() {
+        // Date 1: three qualified positive-bubble fits (b < 0) with
+        // tc 125/130/135 -> pos_conf 1.0, pos_tc = median 130, neg_tc null.
+        // Date 2: three fits that fail the R^2 gate -> pos_conf 0, pos_tc null.
+        let n = 6;
+        let df = df!(
+            "t2_d_i" => &[20000i32, 20000, 20000, 20001, 20001, 20001],
+            "tc" => &[125.0, 130.0, 135.0, 125.0, 130.0, 135.0],
+            "m" => vec![0.5; n],
+            "w" => vec![6.0; n],
+            "a" => vec![0.0; n],
+            "b" => vec![-1.0; n],
+            "c" => vec![0.5; n],
+            "c1" => vec![0.5; n],
+            "c2" => vec![0.0; n],
+            "t1" => vec![0.0; n],
+            "t2" => vec![120.0; n],
+            "O" => vec![3.0; n],
+            "D" => vec![1.0; n],
+            "p2" => vec![0.5; n],
+            "best_cost" => vec![0.1; n],
+            "r2" => &[0.9, 0.9, 0.9, 0.1, 0.1, 0.1],
+        )
+        .unwrap()
+        .lazy()
+        .with_column(col("t2_d_i").cast(DataType::Date).alias("t2_d"))
+        .drop(["t2_d_i"])
+        .collect()
+        .unwrap();
+
+        let out = compute_indicators(df)
+            .unwrap()
+            .lazy()
+            .sort(["t2_d"], Default::default())
+            .collect()
+            .unwrap();
+        assert_eq!(out.height(), 2);
+
+        let pos_conf = out.column("pos_conf").unwrap().f64().unwrap();
+        let pos_tc = out.column("pos_tc").unwrap().f64().unwrap();
+        let neg_tc = out.column("neg_tc").unwrap().f64().unwrap();
+
+        assert!((pos_conf.get(0).unwrap() - 1.0).abs() < 1e-12);
+        assert!((pos_tc.get(0).unwrap() - 130.0).abs() < 1e-12);
+        assert!(neg_tc.get(0).is_none());
+
+        assert!((pos_conf.get(1).unwrap() - 0.0).abs() < 1e-12);
+        assert!(pos_tc.get(1).is_none());
+    }
+
     // Test for get_c
     #[test]
     fn test_get_c() {
@@ -1356,38 +1462,78 @@ mod tests {
 
     #[test]
     fn test_compute_residual_indicator() {
-        // b = c1 = c2 = 0 makes the fitted value equal a (= 0), so the
-        // residual is exactly p2: a ramp whose |eps| is always the running
-        // max (eps_norm = 1 after burn-in), then a final dip to -0.12
-        // against a running max of 0.24 (eps_norm = -0.5).
-        let n = 25;
-        let dates: Vec<i32> = (0..n as i32).collect();
-        let mut p2: Vec<f64> = (0..n).map(|i| 0.01 * (i as f64 + 1.0)).collect();
-        p2[24] = -0.12;
-        let zeros = vec![0.0; n];
+        // b = c1 = c2 = 0 makes the fitted value equal a (= 0.1), so with
+        // p2 = 0.5 every residual is 0.4. Date 1 has three qualified fits
+        // whose SSE gives sigma = 0.1, 0.2, 0.05 over 20 dof (n_obs 27), so
+        // the z-scores are 4, 2, 8 and the median is 4. Date 2's fits fail
+        // the R^2 gate and produce no row.
+        let n = 6;
+        let dof = 20.0;
         let df = polars::df!(
-            "t2_d" => dates,
-            "t2" => vec![100.0; n],
-            "p2" => p2,
+            "t2_d_i" => &[20000i32, 20000, 20000, 20001, 20001, 20001],
+            "t1" => vec![0.0; n],
+            "t2" => vec![120.0; n],
+            "p2" => vec![0.5; n],
             "tc" => vec![130.0; n],
             "m" => vec![0.5; n],
             "w" => vec![8.0; n],
-            "a" => zeros.clone(),
-            "b" => zeros.clone(),
-            "c1" => zeros.clone(),
-            "c2" => zeros,
+            "a" => vec![0.1; n],
+            "b" => vec![0.0; n],
+            "c" => vec![0.0; n],
+            "c1" => vec![0.0; n],
+            "c2" => vec![0.0; n],
+            "O" => vec![3.0; n],
+            "D" => vec![1.0; n],
+            "best_cost" => &[0.01 * dof, 0.04 * dof, 0.0025 * dof, 0.01 * dof, 0.01 * dof, 0.01 * dof],
+            "n_obs" => vec![27i64; n],
+            "r2" => &[0.9, 0.9, 0.9, 0.1, 0.1, 0.1],
         )
         .unwrap()
         .lazy()
-        .with_column(col("t2_d").cast(DataType::Date))
+        .with_column(col("t2_d_i").cast(DataType::Date).alias("t2_d"))
+        .drop(["t2_d_i"])
         .collect()
         .unwrap();
 
         let out = compute_residual_indicator(&df).unwrap();
+        assert_eq!(out.height(), 1, "unqualified date should produce no row");
         let e = out.column("eps_norm").unwrap().f64().unwrap();
-        assert_eq!(e.get(5).unwrap(), 0.0, "burn-in should zero early values");
-        assert!((e.get(21).unwrap() - 1.0).abs() < 1e-9);
-        assert!((e.get(24).unwrap() + 0.5).abs() < 1e-9);
+        assert!((e.get(0).unwrap() - 4.0).abs() < 1e-9, "eps_norm: {}", e.get(0).unwrap());
+    }
+
+    #[test]
+    fn test_tc_filter_is_window_relative() {
+        // dt = 120: tc must lie in [120 - 6, 120 + 24] = [114, 144].
+        let n = 4;
+        let df = polars::df!(
+            "t2_d_i" => vec![20000i32; n],
+            "t1" => vec![0.0; n],
+            "t2" => vec![120.0; n],
+            "tc" => &[110.0, 115.0, 140.0, 150.0],
+            "m" => vec![0.5; n],
+            "w" => vec![8.0; n],
+            "b" => vec![-1.0; n],
+            "c" => vec![0.5; n],
+            "O" => vec![3.0; n],
+            "D" => vec![1.0; n],
+            "r2" => vec![0.9; n],
+        )
+        .unwrap()
+        .lazy()
+        .with_column(col("t2_d_i").cast(DataType::Date).alias("t2_d"))
+        .drop(["t2_d_i"])
+        .collect()
+        .unwrap();
+
+        let q = qualify_fits(df).unwrap();
+        let in_range: Vec<bool> = q
+            .column("tc_in_range")
+            .unwrap()
+            .bool()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(in_range, vec![false, true, true, false]);
     }
 
     // Too-short or misaligned inputs must error rather than return junk.

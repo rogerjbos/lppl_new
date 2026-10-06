@@ -31,6 +31,12 @@ struct TickerRow {
     _ticker: String,
 }
 
+/// Calendar days of stock price history pulled for a testing run. One year
+/// (the production depth) gives ~130 signal days per ticker after the
+/// 120-bar fit window, so with a 126-bar max hold every ticker produced at
+/// most one trade. Fit cost scales linearly with this.
+pub const TESTING_HISTORY_DAYS: u32 = 365 * 5;
+
 pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<dyn StdError>> {
     let user_path = match env::var("CLICKHOUSE_USER_PATH") {
         Ok(path) => path,
@@ -262,10 +268,11 @@ pub async fn write_price_file(univ: String, production: bool) -> Result<(), Box<
                     FROM usd p FINAL
                     INNER JOIN mdate m ON m.symbol = p.symbol
                     CROSS JOIN max_usd_date mu
-                    WHERE p.date >= subtractDays(now(), 365)
+                    WHERE p.date >= subtractDays(now(), {hist})
                     AND m.maxdate = mu.max_date
                     order by Ticker, Date",
-                    ticker_list
+                    ticker_list,
+                    hist = TESTING_HISTORY_DAYS
                 )
             };
             println!(
