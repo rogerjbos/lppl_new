@@ -75,9 +75,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // save fit files to /fit/testing or /fit/production
     if run_fits {
         if overwrite {
-            let folder = format!("{}/fit/{}", path, production_str);
-            // println!("folder: {}", folder);
-            delete_all_files_in_folder(folder).await?;
+            // Only this run's universes, so running the groups one at a time
+            // (LC, then MC, ...) keeps the earlier groups' files.
+            for u in &univ_vec {
+                delete_universe_fits(path, u, production);
+            }
         }
         for u in &univ_vec {
             let _ = fits_helper(path.to_string(), u, batch_size, production).await;
@@ -89,14 +91,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // save parquet files to /output/testing or /output/production
     if run_backtests {
         if overwrite {
-            let s = if univ_vec.iter().any(|u| u == "Crypto") {
-                "_crypto"
-            } else {
-                ""
-            };
-            let folder = format!("{}/output{}/{}", path, s, production_str);
-            // println!("folder: {}", folder);
-            delete_all_files_in_folder(folder).await?;
+            // Same scoping as the fit files: parquets are named by ticker, so
+            // clear only the tickers of the universes being run.
+            for u in &univ_vec {
+                delete_universe_outputs(path, u, production).await?;
+            }
         }
         for u in &univ_vec {
             let _ = backtest_helper(path.to_string(), u, batch_size, production).await;

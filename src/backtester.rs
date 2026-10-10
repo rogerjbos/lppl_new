@@ -582,7 +582,9 @@ pub async fn summary_performance_file(
             .filter(
                 col("universe")
                     .eq(lit("Micro1"))
-                    .or(col("universe").eq(lit("Micro2"))),
+                    .or(col("universe").eq(lit("Micro2")))
+                    .or(col("universe").eq(lit("Micro3")))
+                    .or(col("universe").eq(lit("Micro4"))),
             )
             .collect();
 

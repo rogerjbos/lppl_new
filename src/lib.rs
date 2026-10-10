@@ -76,6 +76,59 @@ pub fn test_test() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
+/// Delete the fit CSVs of one universe (`fit_{universe}_{ticker}.csv`), so a
+/// fresh run of one group (LC, then MC, ...) leaves the other groups alone.
+pub fn delete_universe_fits(path: &str, universe: &str, production: bool) {
+    let folder = if production { "production" } else { "testing" };
+    let fit_dir = format!("{}/fit/{}", path, folder);
+    let prefix = format!("fit_{}_", universe);
+    if let Ok(entries) = std::fs::read_dir(&fit_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let matches = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map_or(false, |n| n.starts_with(&prefix));
+            if p.is_file() && matches {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+}
+
+/// Delete the backtest parquet of every ticker in one universe's price file.
+/// Parquets are named by ticker only, so this is the only way to clear one
+/// group without wiping the results of the groups run before it.
+pub async fn delete_universe_outputs(
+    path: &str,
+    universe: &str,
+    production: bool,
+) -> Result<(), Box<dyn StdError>> {
+    let folder = if production { "production" } else { "testing" };
+    let price_path = format!("{}/data/{}/{}.csv", path, folder, universe);
+    if !Path::new(&price_path).exists() {
+        return Ok(());
+    }
+    let output = if universe == "Crypto" {
+        "output_crypto"
+    } else {
+        "output"
+    };
+    let tickers = read_price_file(price_path)
+        .await?
+        .select([col("Ticker").unique()])
+        .collect()?;
+    for t in tickers.column("Ticker")?.str()?.into_iter().flatten() {
+        let p = format!("{}/{}/{}/{}.parquet", path, output, folder, t);
+        if let Err(e) = std::fs::remove_file(&p) {
+            if e.kind() != ErrorKind::NotFound {
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn delete_all_files_in_folder<P: AsRef<Path>>(path: P) -> Result<(), Error> {
     let path = path.as_ref();
 
@@ -753,13 +806,15 @@ pub async fn run_backtests(
                 f: Arc::new(function_with_params),
             });
 
-            // Recalibrated 2026-07-18 (percent-return backtest, position-based
-            // exits, subordinated 3D fits). SC had NO profitable (p1, p2) cell
-            // in the grid, so thresholds are set to the least-active corner
-            // (fires almost never) rather than a losing strategy.
+            // Recalibrated 2026-10-10 on the five-year run (2021-10..2026-10,
+            // data-break screen, tc exits, pooled over SC1-4, gains capped at
+            // 100%/trade for the ranking). Long side (p2) is the edge: any
+            // qualified negative bubble buys with +3.6%/trade, hit 55%, t 12,
+            // 65% of tickers net positive. Short side is flat; p1 0.40-0.55 is
+            // the only band where it is not negative. 0.45/0.10: 4,601 trades.
             if tag == "sc" || tag == "SC1" || tag == "SC2" || tag == "SC3" || tag == "SC4" {
-                let param1: f64 = 0.80;
-                let param2: f64 = 0.80;
+                let param1: f64 = 0.45;
+                let param2: f64 = 0.10;
                 let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
@@ -778,8 +833,10 @@ pub async fn run_backtests(
                 || tag == "Micro3"
                 || tag == "Micro4"
             {
-                // Recalibrated 2026-07-18: Micro had NO profitable (p1, p2)
-                // cell (worst group in the grid); least-active corner chosen.
+                // Rechecked 2026-10-10 on the five-year run with the data-break
+                // screen: still NO cell with a robust edge (long side -1.1%/trade,
+                // t -2.4 at the loosest p2; the few positive cells have <75
+                // trades). Least-active corner kept, fires a few times a year.
                 let param1: f64 = 0.80;
                 let param2: f64 = 0.80;
                 let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
@@ -795,11 +852,13 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "mc" || tag == "MC1" || tag == "MC2" {
-                // Recalibrated 2026-07-19 (quantile fit gate, m 0.01-0.99,
-                // min 2 qualified windows): positive band at p2 0.15,
-                // p1 0.60-0.80 (expectancy up to +18, ~44-50 trades).
-                let param1: f64 = 0.75;
-                let param2: f64 = 0.15;
+                // Recalibrated 2026-10-10 on the five-year run (pooled MC1-2,
+                // capped gains): best band is p2 0.20-0.25 with p1 0.45-0.80
+                // (+5.5 to +6.5%/trade, hit 57%, t 5.0-5.5, 66% of tickers net
+                // positive). 0.50/0.25: 328 trades. The old 0.75/0.15 scored
+                // +2.7%/trade, t 3.2 on the same data.
+                let param1: f64 = 0.50;
+                let param2: f64 = 0.25;
                 let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
 
                 // Use a closure to capture param1 and param2
@@ -813,10 +872,11 @@ pub async fn run_backtests(
                     f: Arc::new(function_with_params),
                 });
             } else if tag == "lc" || tag == "LC1" || tag == "LC2" {
-                // Recalibrated 2026-07-19 (quantile fit gate, m 0.01-0.99,
-                // min 2 qualified windows): stable positive region at
-                // p1 0.65-0.75, p2 0.15-0.30 (expectancy +18 to +28);
-                // 0.70/0.20 is the consensus center across three passes.
+                // Confirmed 2026-10-10 on the five-year run (pooled LC1-2):
+                // 0.70/0.20 gives 806 trades, +3.9%/trade, hit 62%, t 8.1,
+                // 69% of tickers net positive. The long side carries it
+                // (p2 0.10: t 10.6 on 1,782 trades; p2 0.25-0.35: +4.8 to
+                // +5.8%/trade on fewer). Shorts are flat below p1 0.70.
                 let param1: f64 = 0.70;
                 let param2: f64 = 0.20;
                 let name = format!("lppl_{:.2}_{:.2}", param1, param2).to_string();
@@ -1110,6 +1170,120 @@ pub async fn score(datetag: &str, stocks: bool) -> Result<(), Box<dyn StdError>>
     Ok(())
 }
 
+// Data-break screening of the price files. The vendor's adjusted prices
+// still contain unadjusted reverse splits (e.g. SVRN 0.35 -> 7.35 overnight
+// on zero volume), reused ticker symbols whose history mixes two companies,
+// and sub-penny closes rounded to 2 decimals (0.01 -> 0.02 is a 69% move in
+// log price). All three produce fake crashes/bubbles for the fitter and
+// fake 1000%+ trades for the backtester; in the 2021-2026 Micro run the top
+// cells' edge was entirely such trades. A one-day close ratio outside
+// [BREAK_RATIO_LO, BREAK_RATIO_HI] or a close below BREAK_MIN_PRICE is
+// treated as a break and only one clean segment per ticker is kept.
+pub const BREAK_RATIO_HI: f64 = 2.5;
+pub const BREAK_RATIO_LO: f64 = 0.4;
+pub const BREAK_MIN_PRICE: f64 = 0.10;
+
+/// Keep mask for one ticker's closes in date order: the longest run of rows
+/// with no data break inside it, or the latest such run when `latest` is set
+/// (production must fit the current price regime, not an older one).
+pub fn clean_segment_mask(close: &[f64], latest: bool) -> Vec<bool> {
+    let n = close.len();
+    let mut mask = vec![false; n];
+    if n == 0 {
+        return mask;
+    }
+    let bad = |c: f64| !(c.is_finite() && c >= BREAK_MIN_PRICE);
+
+    // Collect [start, end) of every clean segment.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for i in 0..n {
+        let boundary = if bad(close[i]) {
+            true
+        } else if i == 0 || bad(close[i - 1]) {
+            false
+        } else {
+            let r = close[i] / close[i - 1];
+            r >= BREAK_RATIO_HI || r <= BREAK_RATIO_LO
+        };
+        if bad(close[i]) {
+            if let Some(s) = start.take() {
+                segments.push((s, i));
+            }
+            continue;
+        }
+        if boundary {
+            if let Some(s) = start.take() {
+                segments.push((s, i));
+            }
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        segments.push((s, n));
+    }
+
+    let chosen = if latest {
+        segments.last().copied()
+    } else {
+        // longest; ties go to the most recent one
+        segments
+            .iter()
+            .copied()
+            .fold(None, |best: Option<(usize, usize)>, seg| match best {
+                Some(b) if (b.1 - b.0) > (seg.1 - seg.0) => Some(b),
+                _ => Some(seg),
+            })
+    };
+    if let Some((s, e)) = chosen {
+        for m in mask.iter_mut().take(e).skip(s) {
+            *m = true;
+        }
+    }
+    mask
+}
+
+/// Apply `clean_segment_mask` per ticker to a price frame sorted by
+/// (Ticker, Date) and report what was dropped.
+pub fn keep_clean_segments(df: DataFrame, latest: bool) -> Result<DataFrame, Box<dyn StdError>> {
+    let df = df.sort(["Ticker", "Date"], SortMultipleOptions::default())?;
+    let tickers: Vec<Option<&str>> = df.column("Ticker")?.str()?.into_iter().collect();
+    let closes: Vec<f64> = df
+        .column("Close")?
+        .f64()?
+        .into_iter()
+        .map(|c| c.unwrap_or(f64::NAN))
+        .collect();
+    let n = closes.len();
+    let mut keep = Vec::with_capacity(n);
+    let (mut tickers_total, mut tickers_trimmed) = (0usize, 0usize);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && tickers[j] == tickers[i] {
+            j += 1;
+        }
+        let m = clean_segment_mask(&closes[i..j], latest);
+        tickers_total += 1;
+        if m.iter().any(|k| !k) {
+            tickers_trimmed += 1;
+        }
+        keep.extend(m);
+        i = j;
+    }
+    let kept = keep.iter().filter(|k| **k).count();
+    if kept < n {
+        println!(
+            "data-break screen: kept {} of {} rows; {} of {} tickers trimmed",
+            kept, n, tickers_trimmed, tickers_total
+        );
+    }
+    let mask = BooleanChunked::from_slice("keep".into(), &keep);
+    Ok(df.filter(&mask)?)
+}
+
 pub async fn read_price_file(file_path: String) -> Result<LazyFrame, Box<dyn StdError>> {
     // Manually create the schema and add fields
     let mut schema = Schema::with_capacity(8);
@@ -1124,13 +1298,25 @@ pub async fn read_price_file(file_path: String) -> Result<LazyFrame, Box<dyn Std
     let schema = Arc::new(schema);
 
     // READ IN PRICE FILE
-    let lf: LazyFrame = LazyCsvReader::new(file_path)
+    let lf: DataFrame = LazyCsvReader::new(file_path.clone())
         .with_schema(Some(schema))
         .with_has_header(true)
         .finish()?
         // Drop rows where ln() would be undefined and that would otherwise
         // poison the min-max scaling below.
         .filter(col("Close").is_not_null().and(col("Close").gt(lit(0.0))))
+        .collect()?;
+
+    // Stock files get the data-break screen (see clean_segment_mask). Crypto
+    // is left alone: sub-$0.10 coins and 2.5x days are real there.
+    let screened = if file_path.contains("Crypto") {
+        lf
+    } else {
+        keep_clean_segments(lf, file_path.contains("/production/"))?
+    };
+
+    let lf: LazyFrame = screened
+        .lazy()
         .with_column(
             col("Date")
                 .map(
@@ -1546,5 +1732,36 @@ mod tests {
         let time: Vec<f64> = (0..20).map(|t| t as f64).collect();
         let price = vec![1.0; 19];
         assert!(fit_argmin(&time, &price).is_err());
+    }
+
+    #[test]
+    fn test_clean_segment_mask_picks_longest_or_latest() {
+        // 5 clean rows, then a 4x jump (reverse split), then 3 clean rows.
+        let close = [1.0, 1.1, 1.2, 1.3, 1.4, 5.2, 5.3, 5.4];
+        let longest = clean_segment_mask(&close, false);
+        assert_eq!(longest, [true, true, true, true, true, false, false, false]);
+        let latest = clean_segment_mask(&close, true);
+        assert_eq!(latest, [false, false, false, false, false, true, true, true]);
+
+        // A collapse (ratio <= 0.4) is a break too.
+        let close = [10.0, 10.5, 3.0, 3.1, 3.2, 3.3];
+        assert_eq!(
+            clean_segment_mask(&close, false),
+            [false, false, true, true, true, true]
+        );
+    }
+
+    #[test]
+    fn test_clean_segment_mask_sub_penny_and_normal_moves() {
+        // Sub-penny rows are dropped and split the series; a 2x day is kept.
+        let close = [0.05, 0.05, 1.0, 1.1, 2.1, 2.0];
+        assert_eq!(
+            clean_segment_mask(&close, false),
+            [false, false, true, true, true, true]
+        );
+        // Nothing wrong: everything kept.
+        let close = [3.0, 3.3, 3.1, 2.9];
+        assert_eq!(clean_segment_mask(&close, false), [true; 4]);
+        assert!(clean_segment_mask(&[], false).is_empty());
     }
 }
